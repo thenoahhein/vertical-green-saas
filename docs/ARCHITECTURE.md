@@ -68,13 +68,15 @@ The Census geocoder returns a TIGER street-segment interpolation point, not a
 rooftop or survey point. Attribute matching is therefore important when the
 interpolated point falls outside the authoritative CAD parcel. Census
 geographies resolve the county when possible; unsupported or unavailable
-geographies fall back to querying all supported county adapters. Address
-resolution can be measured against the fixed benchmark with. If Census returns
-no match, the same situs-only query runs across all counties; only an empty
-result produces the typed address-not-found response. Without a point,
-distance is null and candidates are centered from the top-ranked parcel.
-Situs matches are only boosted within 5 km of a geocoded point to prevent a
-distant same-number false match from outranking a containing parcel.
+geographies fall back to querying all supported county adapters.
+If Census returns no match, the same situs-only query runs across all
+counties; only an empty result produces the typed address-not-found response.
+Without a point, distance is null and candidates are centered from the
+top-ranked parcel. Situs matches are only boosted within 5 km of a geocoded
+point to prevent a distant same-number false match from outranking a
+containing parcel.
+
+Address resolution can be measured against the fixed benchmark with:
 
 ```bash
 uv run python scripts/benchmark_address_resolution.py
