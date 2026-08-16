@@ -168,6 +168,24 @@ def test_two_channel_confluence_accumulates_downstream() -> None:
     assert float(result.flow_accumulation[-1].max()) > float(result.flow_accumulation[32].max())
 
 
+def test_accumulation_uses_pointer_codes_as_cells_and_filters_channel_noise() -> None:
+    if not _whitebox_available():
+        pytest.fail("CI must warm the WhiteboxTools binary before routing tests.")
+    rows, cols = np.indices((32, 32))
+    elevation = (np.abs(cols - 16) * 2 - rows).astype("float32")
+    result = run_hydrology(
+        elevation,
+        from_origin(0, 32, 1, 1),
+        "EPSG:26914",
+        box(10, 10, 22, 22),
+        1.0,
+    )
+    valid_cells = int(result.metrics["valid_cell_count"])
+    assert float(result.metrics["max_flow_accumulation_cells"]) >= valid_cells * 0.8
+    assert len(result.corridors) <= 5
+    assert float(result.flow_accumulation[-1].max()) >= valid_cells * 0.8
+
+
 def test_corridor_metrics_and_mapped_water_relationships() -> None:
     accumulation = np.zeros((8, 8), dtype="float32")
     accumulation[:, 2] = np.arange(8)

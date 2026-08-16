@@ -146,6 +146,26 @@ metadata. Depressions, ridgelines, valleys, catchments, and corridor
 statistics are local-window products and are not authoritative watershed
 delineations.
 
+The D8 accumulation operation is explicitly invoked with Whitebox's `pntr`
+flag because its input is the D8 pointer raster, not an elevation raster.
+Accumulation output is therefore measured in cells (`out_type=cells`). The
+default stream threshold is 100 cells for the 1-meter DEM workflow.
+
+Hydrology products are filtered rather than dissolved into a single geometry.
+The named defaults for 1-meter lidar are:
+
+- depressions: minimum 9 m² area and 0.3 m maximum fill depth;
+- local catchments: minimum 100 m² area;
+- ridgelines and major valleys: minimum 1 m centerline length (one DEM cell).
+
+Each retained depression is persisted separately with fill depth and an
+estimated filled volume. Each retained catchment remains a partition feature,
+and each retained ridge/valley remains a centerline feature. Applied minimums
+are recorded in layer metadata, so omitted small features are distinguishable
+from missing analysis output. Raster masks for ridges and valleys are traced
+through cell centers and filtered by length; polygon boundaries are never used
+as their line representation.
+
 Corridor contributing acreage is calculated independently for each extracted
 drainage corridor from the maximum accumulation cells along that corridor.
 Parcel intersection is reported as corridor length inside the parcel, in
