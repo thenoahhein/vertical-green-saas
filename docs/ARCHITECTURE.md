@@ -94,3 +94,30 @@ Fixtures drive normal tests. `scripts/live_source_health.py` is an explicit
 opt-in check for upstream availability and is excluded from CI.
 
 TxGIO StratMap statewide parcels is bulk-download-only: its public MapServer `/query` capability is disabled. Launch-county parcel adapters use the verified ArcGIS FeatureServers (layer 0) for Bastrop, Lee, Fayette, and Caldwell. USGS 3DEP uses public `prd-tnm` staged COGs / TNMAccess; USDA Soil Data Access requires POST; TWDB, FEMA NFHL, and USFWS NWI are registered as ArcGIS services.
+
+## Terrain analysis
+
+Terrain is the first payload of the asynchronous analysis pipeline. A confirmed
+parcel analysis queries TNMAccess for products intersecting the parcel plus a
+configurable 500-meter buffer, prefers complete 1-meter 3DEP coverage, and
+falls back to 1/3 arc-second DEM coverage when required. Product metadata is
+stored in `data_sources`; every raster or contour layer records
+`analysis_source_refs` back to the selected product rows.
+
+Derivatives run on a projected metre grid after all intersecting COG windows
+have been mosaicked. NumPy implements Horn 3x3 slope, aspect, and hillshade
+derivatives. Raw elevation remains the raster basis, while reported slope
+statistics use a 3x3 focal-mean-smoothed elevation surface to produce a
+planning-grade contractor metric. Elevations are stored in metres and payloads
+also expose contractor-facing feet values. Contours use matplotlib, a 2-foot
+interval at 1-meter source resolution (5 feet otherwise), and are stored as
+4326 geometries with 10-foot index metadata.
+
+Terrain rasters are written as COGs to the S3-compatible object store under
+organization/project/analysis-scoped keys. Coverage below 99 percent produces
+a typed warning naming the missing fraction; zero valid parcel coverage
+produces a typed source-unavailable warning while the job remains partial.
+
+Hydrologically conditioned terrain products are intentionally not part of this
+milestone. Local depressions, ridgelines, valleys, and terrain-derived drainage
+networks require flow routing and belong to Milestone 3.
