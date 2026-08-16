@@ -55,6 +55,26 @@ Missing fields remain null. Unmapped fields are retained in
 `raw_source_attributes`; computed acreage is calculated from normalized
 geometry and is deliberately separate from appraisal-record acreage.
 
+Parcel search uses a hybrid candidate strategy. The geocoded point drives a
+paginated ArcGIS envelope query, while the parsed house number and normalized
+situs street tokens drive a second attribute query. Results are merged by
+county source feature ID before ranking. Exact situs matches rank ahead of
+containing parcels, followed by true projected polygon distance; the API
+returns only the first ten candidates after ranking. ArcGIS pages use each
+service's configured `maxRecordCount` and continue while
+`exceededTransferLimit` is set.
+
+The Census geocoder returns a TIGER street-segment interpolation point, not a
+rooftop or survey point. Attribute matching is therefore important when the
+interpolated point falls outside the authoritative CAD parcel. Census
+geographies resolve the county when possible; unsupported or unavailable
+geographies fall back to querying all supported county adapters. Address
+resolution can be measured against the fixed benchmark with:
+
+```bash
+uv run python scripts/benchmark_address_resolution.py
+```
+
 To add a county, inspect and record its layer metadata, add a
 `CountySource`/`ParcelFieldMapping`, register its `DataSource` in `seed.py`,
 and provide a response fixture before enabling the adapter in production.
