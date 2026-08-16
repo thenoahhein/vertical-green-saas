@@ -20,8 +20,12 @@ from shapely.geometry import LineString, MultiLineString, Polygon, shape
 from shapely.ops import linemerge, unary_union
 
 ACRE_SQUARE_METERS = 4046.8564224
-DEFAULT_STREAM_THRESHOLD_CELLS = 20
+DEFAULT_STREAM_THRESHOLD_CELLS = 100
 DEFAULT_WINDOW_INFLOW_THRESHOLD_CELLS = 100
+MIN_DEPRESSION_AREA_M2 = 9.0
+MIN_DEPRESSION_DEPTH_M = 0.3
+MIN_CATCHMENT_AREA_M2 = 100.0
+MIN_RIDGE_VALLEY_LENGTH_M = 1.0
 HYDROGRAPHY_URL = (
     "https://3dhp.nationalmap.gov/arcgis/rest/services/usgs_3dhp_all/FeatureServer"
 )
@@ -52,13 +56,20 @@ class HydroCorridor:
 
 
 @dataclass
+class HydroDepression:
+    geometry: Polygon
+    depth_m: float
+    volume_m3: float
+
+
+@dataclass
 class HydrologyResult:
     conditioned: np.ndarray
     flow_direction: np.ndarray
     flow_accumulation: np.ndarray
     drainage_lines: list[LineString | MultiLineString]
     catchments: list[Polygon]
-    depressions: list[Polygon]
+    depressions: list[HydroDepression]
     ridgelines: list[LineString | MultiLineString]
     valleys: list[LineString | MultiLineString]
     corridors: list[HydroCorridor]
@@ -120,7 +131,12 @@ def _vectorize_mask(
     predicate: Any,
 ) -> list[Polygon]:
     result: list[Polygon] = []
-    for geometry, value in shapes(values.astype("int16"), mask=predicate(values), transform=transform):
+    mask = predicate(values)
+    for geometry, value in shapes(
+        np.ones(values.shape, dtype="uint8"),
+        mask=mask,
+        transform=transform,
+    ):
         if value:
             candidate = shape(geometry)
             if isinstance(candidate, Polygon) and not candidate.is_empty:
@@ -194,6 +210,44 @@ def _corridor_contributing_acres(
     if not values.size:
         return 0.0
     return float(np.max(values) * pixel_area / ACRE_SQUARE_METERS)
+
+
+def _filter_lines_by_length(
+    lines: list[LineString | MultiLineString],
+    minimum_length_m: float,
+) -> list[LineString | MultiLineString]:
+    return [line for line in lines if line.length >= minimum_length_m]
+
+
+def _depression_features(
+    polygons: list[Polygon],
+    elevation: np.ndarray,
+    conditioned: np.ndarray,
+    transform: Affine,
+    pixel_area: float,
+) -> list[HydroDepression]:
+    features: list[HydroDepression] = []
+    for polygon in polygons:
+        if polygon.area < MIN_DEPRESSION_AREA_M2:
+            continue
+        mask = geometry_mask(
+            [polygon],
+            out_shape=elevation.shape,
+            transform=transform,
+            invert=True,
+        )
+        depth = np.maximum(conditioned - elevation, 0.0)
+        depths = depth[mask & np.isfinite(depth)]
+        if not depths.size or float(np.max(depths)) < MIN_DEPRESSION_DEPTH_M:
+            continue
+        features.append(
+            HydroDepression(
+                geometry=polygon,
+                depth_m=float(np.max(depths)),
+                volume_m3=float(np.sum(depths) * pixel_area),
+            )
+        )
+    return features
 
 
 def assign_mapped_water_relationships(
@@ -291,7 +345,9 @@ def run_hydrology(
                 raise HydrologySourceError("WhiteboxTools fill_depressions_wang_and_liu failed.")
             if tools.d8_pointer(str(conditioned_path), str(pointer_path)) != 0:
                 raise HydrologySourceError("WhiteboxTools d8_pointer failed.")
-            if tools.d8_flow_accumulation(str(pointer_path), str(accumulation_path)) != 0:
+            if tools.d8_flow_accumulation(
+                str(pointer_path), str(accumulation_path), out_type="cells", pntr=True
+            ) != 0:
                 raise HydrologySourceError("WhiteboxTools d8_flow_accumulation failed.")
             if tools.extract_streams(
                 str(accumulation_path), str(streams_path), stream_threshold_cells, zero_background=True
@@ -320,7 +376,6 @@ def run_hydrology(
         flow_accumulation = _read_raster(accumulation_path)
         streams = _read_raster(streams_path)
         subbasins = _read_raster(subbasins_path)
-        sinks = _read_raster(sinks_path)
         ridges = _read_raster(ridges_path)
         valley_raster = _read_raster(valleys_path)
         drainage_lines = _read_vector_lines(streams_vector_path)
@@ -357,14 +412,25 @@ def run_hydrology(
                 "contributing_acres_is_lower_bound": True,
             }
         )
-    raw_catchments = _vectorize_mask(subbasins, transform, lambda values: values > 0)
-    raw_depressions = _vectorize_mask(sinks, transform, lambda values: values > 0)
-    raw_ridgeline_masks = _vectorize_mask(ridges, transform, lambda values: values > 0)
-    raw_valley_masks = _vectorize_mask(valley_raster, transform, lambda values: values > 0)
-    catchments = _dissolve_polygons(raw_catchments)
-    depressions = _dissolve_polygons(raw_depressions)
-    ridgelines = _raster_mask_to_lines(ridges, transform)
-    valleys = _raster_mask_to_lines(valley_raster, transform)
+    raw_catchments = [
+        polygon
+        for polygon in _vectorize_mask(subbasins, transform, lambda values: values > 0)
+        if polygon.area >= MIN_CATCHMENT_AREA_M2
+    ]
+    depression_depth = np.maximum(conditioned - elevation, 0.0)
+    raw_depressions = _vectorize_mask(
+        depression_depth, transform, lambda values: values >= MIN_DEPRESSION_DEPTH_M
+    )
+    catchments = raw_catchments
+    depressions = _depression_features(
+        raw_depressions, elevation, conditioned, transform, pixel_area
+    )
+    ridgelines = _filter_lines_by_length(
+        _raster_mask_to_lines(ridges, transform), MIN_RIDGE_VALLEY_LENGTH_M
+    )
+    valleys = _filter_lines_by_length(
+        _raster_mask_to_lines(valley_raster, transform), MIN_RIDGE_VALLEY_LENGTH_M
+    )
     corridors: list[HydroCorridor] = []
     for line in drainage_lines:
         parcel_intersection = line.intersection(parcel_geometry)
@@ -393,10 +459,18 @@ def run_hydrology(
         "contributing_acres_is_lower_bound": truncated,
         "analysis_scope": "within analysis window",
         "local_depression_count": len(raw_depressions),
-        "ridge_segment_count": len(raw_ridgeline_masks),
-        "valley_segment_count": len(raw_valley_masks),
+        "filtered_depression_count": len(depressions),
+        "ridge_segment_count": len(ridgelines),
+        "valley_segment_count": len(valleys),
         "drainage_line_count": len(drainage_lines),
         "catchment_count": len(catchments),
+        "filtered_catchment_count": len(catchments),
+        "depression_min_area_m2": MIN_DEPRESSION_AREA_M2,
+        "depression_min_depth_m": MIN_DEPRESSION_DEPTH_M,
+        "catchment_min_area_m2": MIN_CATCHMENT_AREA_M2,
+        "ridge_valley_min_length_m": MIN_RIDGE_VALLEY_LENGTH_M,
+        "valid_cell_count": int(np.count_nonzero(valid)),
+        "max_flow_accumulation_cells": float(np.nanmax(flow_accumulation)),
         "parcel_acres": parcel_acres,
         "potential_water_management_review_required": True,
         "whitebox_binary_version": binary_version,

@@ -15,7 +15,7 @@ from geoalchemy2.elements import WKBElement
 from geoalchemy2.shape import from_shape, to_shape
 from pyproj import Transformer
 from rasterio.shutil import copy as copy_raster
-from shapely.ops import transform, unary_union
+from shapely.ops import transform
 from sitesense.config import get_settings
 from sitesense.hydrology import (
     HYDROGRAPHY_URL,
@@ -203,6 +203,14 @@ def _persist_hydrology(
         "valley_segment_count": "count",
         "drainage_line_count": "count",
         "catchment_count": "count",
+        "filtered_depression_count": "count",
+        "filtered_catchment_count": "count",
+        "depression_min_area_m2": "square_metres",
+        "depression_min_depth_m": "metres",
+        "catchment_min_area_m2": "square_metres",
+        "ridge_valley_min_length_m": "metres",
+        "valid_cell_count": "cells",
+        "max_flow_accumulation_cells": "cells",
     }
     for name, value in hydrology.metrics.items():
         if value is None or not isinstance(value, (bool, int, float)):
@@ -282,32 +290,45 @@ def _persist_hydrology(
                 "vectorization_method": hydrology.metrics["drainage_vectorization_method"],
             },
         )
-    if hydrology.catchments:
+    for polygon in hydrology.catchments:
         add_geometry_layer(
             "hydrology_local_catchments",
-            unary_union(hydrology.catchments),
-            {"analysis_scope": "within analysis window"},
+            polygon,
+            {
+                "analysis_scope": "within analysis window",
+                "minimum_area_m2": hydrology.metrics["catchment_min_area_m2"],
+            },
         )
-    if hydrology.depressions:
+    for depression in hydrology.depressions:
         add_geometry_layer(
             "hydrology_local_depressions",
-            unary_union(hydrology.depressions),
+            depression.geometry,
             {
                 "label": "potential water-management investigation area",
                 "requires_contractor_review": True,
+                "minimum_area_m2": hydrology.metrics["depression_min_area_m2"],
+                "minimum_depth_m": hydrology.metrics["depression_min_depth_m"],
+                "depth_m": depression.depth_m,
+                "volume_m3": depression.volume_m3,
             },
         )
     for line in hydrology.ridgelines:
         add_geometry_layer(
             "hydrology_ridgelines",
             line,
-            {"requires_contractor_review": True},
+            {
+                "requires_contractor_review": True,
+                "minimum_length_m": hydrology.metrics["ridge_valley_min_length_m"],
+            },
         )
     for line in hydrology.valleys:
         add_geometry_layer(
             "hydrology_major_valleys",
             line,
-            {"requires_contractor_review": True},
+            {
+                "requires_contractor_review": True,
+                "minimum_length_m": hydrology.metrics["ridge_valley_min_length_m"],
+            },
         )
     for corridor in hydrology.corridors:
         add_geometry_layer(
