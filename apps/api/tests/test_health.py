@@ -10,5 +10,5 @@ def test_health() -> None:
 
 def test_planned_endpoint_is_explicit() -> None:
     response = TestClient(app).get("/api/parcel-search")
-    assert response.status_code == 501
-    assert "later handoff" in response.json()["detail"]
+    assert response.status_code == 422
+    assert "Provide address" in response.json()["detail"]

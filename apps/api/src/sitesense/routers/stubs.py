@@ -118,11 +118,6 @@ def get_proposal(project_id: UUID) -> JSONResponse:
     return planned()
 
 
-@project_router.get("/parcel", response_model=NotImplementedResponse, status_code=501)
-def get_project_parcel(project_id: UUID) -> JSONResponse:
-    return planned()
-
-
 @project_router.patch("/features/{feature_id}", response_model=NotImplementedResponse, status_code=501)
 def update_feature(feature_id: UUID, payload: FeatureUpdate) -> JSONResponse:
     return planned()
