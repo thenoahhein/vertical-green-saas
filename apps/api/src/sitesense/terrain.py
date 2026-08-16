@@ -27,6 +27,17 @@ DEFAULT_TERRAIN_BUFFER_METERS = 500.0
 ONE_METER_DATASET = "Digital Elevation Model (DEM) 1 meter"
 THIRD_ARC_SECOND_DATASET = "National Elevation Dataset (NED) 1/3 arc-second"
 NODATA = -3.4028230607370965e38
+MAX_ANALYSIS_CELLS = 9_000_000
+
+
+def valid_data_mask(values: np.ndarray, nodata: float = NODATA) -> np.ndarray:
+    """Return cells that are finite and distinct from the declared nodata value."""
+    finite = np.isfinite(values)
+    if math.isnan(nodata):
+        return finite
+    tolerance = max(abs(nodata) * 1e-7, 1e-6)
+    difference = np.abs(values.astype("float64") - float(nodata))
+    return finite & (difference > tolerance)
 
 
 class TerrainSourceError(RuntimeError):
@@ -254,6 +265,12 @@ def read_mosaic(
     except (rasterio.errors.RasterioError, OSError) as exc:
         raise TerrainSourceError(f"3DEP raster read failed: {exc}") from exc
     target_transform, width, height = _target_grid(target_bounds, resolution)
+    if width * height > MAX_ANALYSIS_CELLS:
+        raise TerrainSourceError(
+            f"Terrain analysis grid has {width * height:,} cells; "
+            f"the maximum supported size is {MAX_ANALYSIS_CELLS:,} "
+            f"(dimensions {width}x{height} at {resolution:g} m)."
+        )
     destination = np.full((height, width), NODATA, dtype="float32")
     filled = np.zeros(destination.shape, dtype=bool)
     contributors: list[str] = []
@@ -282,7 +299,7 @@ def read_mosaic(
                     dst_nodata=NODATA,
                     resampling=Resampling.bilinear,
                 )
-                valid = (reprojected != NODATA) & ~filled
+                valid = valid_data_mask(reprojected) & ~filled
                 if valid.any():
                     destination[valid] = reprojected[valid]
                     filled[valid] = True
@@ -340,8 +357,10 @@ def _metric_values(
     valid_pixels = int(valid_parcel.sum())
     coverage = valid_pixels / parcel_pixels if parcel_pixels else 0.0
     elevation_values = elevation[valid_parcel]
-    slope_values = slope_percent[valid_parcel & np.isfinite(slope_percent)]
-    slope_degree_values = slope_degrees[valid_parcel & np.isfinite(slope_degrees)]
+    slope_values = slope_percent[valid_parcel & valid_data_mask(slope_percent, np.nan)]
+    slope_degree_values = slope_degrees[
+        valid_parcel & valid_data_mask(slope_degrees, np.nan)
+    ]
     if not len(elevation_values):
         return {
             "coverage_fraction": coverage,
@@ -390,7 +409,7 @@ def generate_contours(
     clip_geometry: Any,
     interval_feet: float,
 ) -> list[tuple[float, bool, LineString | MultiLineString]]:
-    valid = np.isfinite(elevation)
+    valid = valid_data_mask(elevation)
     if not valid.any():
         return []
     minimum = float(np.nanmin(elevation))
@@ -445,7 +464,7 @@ def analyze_elevation(
     buffer_geometry: Any,
     parcel_acres: float | None,
 ) -> TerrainResult:
-    valid = np.isfinite(elevation) & (elevation != NODATA)
+    valid = valid_data_mask(elevation)
     clean_elevation = np.where(valid, elevation, np.nan).astype("float32")
     pixel_area = abs(transform.a * transform.e)
     parcel_mask = geometry_mask(
@@ -461,7 +480,7 @@ def analyze_elevation(
         invert=True,
     )
     smoothed = _focal_mean(clean_elevation, valid)
-    smooth_valid = np.isfinite(smoothed)
+    smooth_valid = valid_data_mask(smoothed, np.nan)
     raw_dzdx, raw_dzdy = _horn_derivatives(clean_elevation, valid, abs(transform.a))
     stats_dzdx, stats_dzdy = _horn_derivatives(smoothed, smooth_valid, abs(transform.a))
     slope_percent = np.hypot(raw_dzdx, raw_dzdy) * 100

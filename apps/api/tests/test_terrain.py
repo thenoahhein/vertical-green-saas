@@ -5,7 +5,7 @@ from pathlib import Path
 import httpx
 import numpy as np
 import pytest
-from rasterio.transform import from_origin
+from rasterio.transform import Affine, from_origin
 from rasterio.warp import transform_bounds
 from shapely.geometry import MultiPolygon, box
 from sitesense.terrain import (
@@ -14,6 +14,7 @@ from sitesense.terrain import (
     THIRD_ARC_SECOND_DATASET,
     TerrainProduct,
     TerrainSelection,
+    TerrainSourceError,
     analyze_elevation,
     cached_products_for_bounds,
     generate_contours,
@@ -185,6 +186,8 @@ def test_nodata_produces_typed_coverage_warning() -> None:
     assert result.warning is not None
     assert result.warning["code"] == "terrain_coverage_incomplete"
     assert result.warning["missing_fraction"] > 0
+    assert result.metrics["elevation_min_m"] == pytest.approx(150)
+    assert result.metrics["elevation_max_m"] == pytest.approx(150)
 
 
 def test_zero_coverage_produces_source_unavailable_warning() -> None:
@@ -224,6 +227,25 @@ def test_adjacent_fixture_tiles_mosaic_on_one_grid() -> None:
     assert np.all(mosaic[:16, :16] == 100)
     assert np.all(mosaic[:16, 16:] == 200)
     assert contributors == (str(root / "seam_left.tif"), str(root / "seam_right.tif"))
+
+
+def test_mosaic_rejects_oversized_analysis_grid(monkeypatch: pytest.MonkeyPatch) -> None:
+    root = Path(__file__).parent / "fixtures" / "terrain"
+    product = TerrainProduct(
+        "left",
+        ONE_METER_DATASET,
+        str(root / "seam_left.tif"),
+        (500000, 0, 500016, 16),
+        "1 m",
+        None,
+        None,
+    )
+    monkeypatch.setattr(
+        "sitesense.terrain._target_grid",
+        lambda *_args: (Affine.identity(), 3001, 3001),
+    )
+    with pytest.raises(TerrainSourceError, match="maximum supported size"):
+        read_mosaic((product,), (0.0, 0.0, 1.0, 1.0), "EPSG:26914")
 
 
 def test_overlapping_tiles_prefer_newest_publication_and_contributors() -> None:

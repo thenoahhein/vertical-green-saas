@@ -19,6 +19,8 @@ from rasterio.transform import Affine
 from shapely.geometry import LineString, MultiLineString, Polygon, shape
 from shapely.ops import linemerge, unary_union
 
+from sitesense.terrain import valid_data_mask
+
 ACRE_SQUARE_METERS = 4046.8564224
 DEFAULT_STREAM_THRESHOLD_CELLS = 100
 DEFAULT_WINDOW_INFLOW_THRESHOLD_CELLS = 100
@@ -122,7 +124,10 @@ def _write_raster(
 
 def _read_raster(path: Path) -> np.ndarray:
     with rasterio.open(path) as dataset:
-        return np.asarray(dataset.read(1), dtype="float32")
+        values = np.asarray(dataset.read(1), dtype="float32")
+        if dataset.nodata is not None:
+            values[~valid_data_mask(values, float(dataset.nodata))] = np.nan
+        return values
 
 
 def _vectorize_mask(
@@ -206,7 +211,7 @@ def _corridor_contributing_acres(
         transform=transform,
         invert=True,
     )
-    values = flow_accumulation[mask & np.isfinite(flow_accumulation)]
+    values = flow_accumulation[mask & valid_data_mask(flow_accumulation, np.nan)]
     if not values.size:
         return 0.0
     return float(np.max(values) * pixel_area / ACRE_SQUARE_METERS)
@@ -236,12 +241,7 @@ def _depression_features(
             transform=transform,
             invert=True,
         )
-        valid_cells = (
-            np.isfinite(conditioned)
-            & np.isfinite(elevation)
-            & (conditioned > -1e30)
-            & (elevation > -1e30)
-        )
+        valid_cells = valid_data_mask(conditioned, np.nan) & valid_data_mask(elevation, np.nan)
         depth = np.zeros(conditioned.shape, dtype="float64")
         np.subtract(
             conditioned.astype("float64"),
@@ -250,7 +250,7 @@ def _depression_features(
             where=valid_cells,
         )
         np.maximum(depth, 0.0, out=depth)
-        depths = depth[mask & np.isfinite(depth)]
+        depths = depth[mask & valid_data_mask(depth, np.nan)]
         if not depths.size or float(np.max(depths)) < MIN_DEPRESSION_DEPTH_M:
             continue
         features.append(
@@ -331,9 +331,9 @@ def run_hydrology(
 ) -> HydrologyResult:
     """Run the complete local routing workflow in a cleaned per-job directory."""
     binary_version = whitebox_binary_version()
-    if not np.isfinite(elevation).any():
+    valid = valid_data_mask(elevation)
+    if not valid.any():
         raise HydrologySourceError("The DEM contains no valid cells for hydrology.")
-    valid = np.isfinite(elevation) & (elevation > -1e30)
     nodata = -9999.0
     vectorization_method = "raster-cell-centerline"
     with tempfile.TemporaryDirectory(prefix="sitesense-hydrology-") as directory:
@@ -402,12 +402,14 @@ def run_hydrology(
     boundary = np.zeros(stream_mask.shape, dtype=bool)
     boundary[0, :] = boundary[-1, :] = True
     boundary[:, 0] = boundary[:, -1] = True
-    boundary_accumulation = flow_accumulation[boundary & np.isfinite(flow_accumulation)]
+    boundary_accumulation = flow_accumulation[
+        boundary & valid_data_mask(flow_accumulation, np.nan)
+    ]
     inflow_cells = int((boundary_accumulation >= inflow_threshold_cells).sum())
     max_boundary_accumulation = (
         int(np.nanmax(boundary_accumulation)) if boundary_accumulation.size else 0
     )
-    stream_values = flow_accumulation[stream_mask & np.isfinite(flow_accumulation)]
+    stream_values = flow_accumulation[stream_mask & valid_data_mask(flow_accumulation, np.nan)]
     local_contributing_acres = (
         float(np.nanmax(stream_values) * pixel_area / ACRE_SQUARE_METERS)
         if stream_values.size
@@ -431,10 +433,8 @@ def run_hydrology(
         if polygon.area >= MIN_CATCHMENT_AREA_M2
     ]
     valid_depth_cells = (
-        np.isfinite(conditioned)
-        & np.isfinite(elevation)
-        & (conditioned > -1e30)
-        & (elevation > -1e30)
+        valid_data_mask(conditioned, np.nan)
+        & valid_data_mask(elevation, np.nan)
     )
     depression_depth = np.zeros(conditioned.shape, dtype="float64")
     np.subtract(

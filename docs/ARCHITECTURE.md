@@ -185,11 +185,20 @@ Contributing acreage is always labeled `within analysis window`. Boundary
 inflow is detected from accumulation values at the analysis-window edge. When
 significant inflow is present, the value is a lower bound and the payload
 emits `hydrology_window_truncated`; one bounded expansion from the default
-500-meter buffer to 2 kilometers is attempted. The system never publishes a
-bare parcel-scale watershed acreage from a local window. WBD HUC10/HUC12
+500-meter buffer to 2 kilometers is attempted only for a real accumulation
+inflow signal. Analysis grids are capped at 9,000,000 cells so the expansion
+cannot silently allocate an unbounded raster; oversized requests degrade with
+a typed terrain-source error. The system never publishes a bare parcel-scale
+watershed acreage from a local window. WBD HUC10/HUC12
 membership is regional context only, and the absence of a local 3DHP
 Catchment feature is recorded as unavailable rather than treated as proof of
 no upstream watershed.
+
+All raster products use one nodata validity rule: a cell must be finite and
+different from the declared nodata value within a numeric tolerance. This
+rule is applied to terrain metrics, hydrology inputs, depression attributes,
+and COG output. The float32 sentinel is not valid elevation data merely
+because it passes `isfinite`.
 
 USGS 3DHP flowlines, waterbodies, and hydrolocations are stored as reference
 layers with independent provenance. Terrain-derived depressions and water

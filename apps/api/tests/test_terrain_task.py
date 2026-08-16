@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 from rasterio.io import MemoryFile
 from rasterio.transform import from_origin
+from sitesense import terrain
 from sitesense.models import Job, JobStage, Project
 from sitesense.terrain import TerrainSourceError
 from sitesense_worker import tasks
@@ -19,6 +20,19 @@ def test_cog_round_trip_preserves_valid_raster_values() -> None:
     assert float(round_trip.min()) == pytest.approx(float(source.min()))
     assert float(round_trip.max()) == pytest.approx(float(source.max()))
     assert float(round_trip.mean()) == pytest.approx(float(source.mean()))
+
+
+def test_cog_round_trip_excludes_float32_nodata_sentinel() -> None:
+    source = np.array(
+        [[terrain.NODATA, 10.0], [20.0, 30.0]],
+        dtype="float32",
+    )
+    content = tasks._write_cog(source, from_origin(0, 2, 1, 1), "EPSG:26914", terrain.NODATA)
+    with MemoryFile(content).open() as dataset:
+        round_trip = dataset.read(1, masked=True)
+    assert round_trip.count() == 3
+    assert float(round_trip.min()) == pytest.approx(10.0)
+    assert float(round_trip.max()) == pytest.approx(30.0)
 
 
 @pytest.mark.asyncio

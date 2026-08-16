@@ -52,6 +52,7 @@ from sitesense.terrain import (
     cached_products_for_bounds,
     read_mosaic,
     select_products,
+    valid_data_mask,
 )
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
@@ -78,6 +79,7 @@ def _object_store() -> Any:
 
 
 def _write_cog(array: np.ndarray, transform_: Any, crs: str, nodata: float) -> bytes:
+    safe_array = np.where(valid_data_mask(array, nodata), array, nodata).astype("float32")
     with tempfile.TemporaryDirectory() as directory:
         source_path = Path(directory) / "source.tif"
         output_path = Path(directory) / "output.tif"
@@ -97,7 +99,7 @@ def _write_cog(array: np.ndarray, transform_: Any, crs: str, nodata: float) -> b
             blockysize=256,
             compress="DEFLATE",
         ) as dataset:
-            dataset.write(array.astype("float32"), 1)
+            dataset.write(safe_array, 1)
         copy_raster(source_path, output_path, driver="COG", compress="DEFLATE", overview_resampling="average")
         content = output_path.read_bytes()
         with rasterio.MemoryFile(content).open() as dataset:
@@ -309,8 +311,9 @@ def _persist_hydrology(
     pending_layers: list[AnalysisLayer] = []
     for layer_name, array in raster_outputs.items():
         key = f"{object_prefix}/{layer_name}.tif"
-        output = np.where(np.isfinite(array), array, -9999.0)
-        _upload(key, _write_cog(output, hydrology.transform, hydrology.crs, -9999.0))
+        output_nodata = -9999.0
+        output = np.where(valid_data_mask(array, output_nodata), array, output_nodata)
+        _upload(key, _write_cog(output, hydrology.transform, hydrology.crs, output_nodata))
         layer = AnalysisLayer(
             organization_id=job.organization_id,
             analysis_id=analysis.id,
@@ -612,9 +615,10 @@ def _terrain_analysis(session: Session, job: Job) -> None:
         "terrain_slope": result.slope_percent,
         "terrain_hillshade": result.hillshade,
     }.items():
-        output = np.where(np.isfinite(array), array, -3.4028230607370965e38)
+        output_nodata = -3.4028230607370965e38
+        output = np.where(valid_data_mask(array, output_nodata), array, output_nodata)
         key = f"{object_prefix}/{category_name}.tif"
-        _upload(key, _write_cog(output, result.transform, result.crs, -3.4028230607370965e38))
+        _upload(key, _write_cog(output, result.transform, result.crs, output_nodata))
         layer = AnalysisLayer(
             organization_id=job.organization_id,
             analysis_id=analysis.id,
@@ -730,7 +734,7 @@ def _terrain_analysis(session: Session, job: Job) -> None:
             parcel_projected,
             parcel.computed_acres,
         )
-        if hydrology_result.warnings:
+        if hydrology_result.metrics.get("window_truncated") is True:
             hydrology_buffer_meters = 2000.0
             expanded_projected = parcel_projected.buffer(hydrology_buffer_meters)
             expanded_wgs84 = transform(inverse.transform, expanded_projected)
