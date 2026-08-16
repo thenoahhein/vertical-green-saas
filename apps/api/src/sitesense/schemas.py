@@ -1,3 +1,4 @@
+from typing import Any
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -19,7 +20,7 @@ class JobRead(BaseModel):
     id: UUID
     project_id: UUID
     stage: str
-    category_status: dict[str, str]
+    category_status: dict[str, Any]
     error_detail: str | None = None
 
 

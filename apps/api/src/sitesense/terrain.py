@@ -249,6 +249,8 @@ def read_mosaic(
     products: tuple[TerrainProduct, ...],
     target_bounds_wgs84: tuple[float, float, float, float],
     target_crs: str,
+    *,
+    resolution: float | None = None,
 ) -> tuple[np.ndarray, Affine, str, tuple[str, ...]]:
     """Window-read product COGs and mosaic them on one nodata-aware grid."""
     if not products:
@@ -261,15 +263,16 @@ def read_mosaic(
     )
     try:
         with rasterio.open(ordered_products[0].source_url) as first:
-            resolution = _source_resolution(first)
+            source_resolution = _source_resolution(first)
     except (rasterio.errors.RasterioError, OSError) as exc:
         raise TerrainSourceError(f"3DEP raster read failed: {exc}") from exc
-    target_transform, width, height = _target_grid(target_bounds, resolution)
+    target_resolution = resolution or source_resolution
+    target_transform, width, height = _target_grid(target_bounds, target_resolution)
     if width * height > MAX_ANALYSIS_CELLS:
         raise TerrainSourceError(
             f"Terrain analysis grid has {width * height:,} cells; "
             f"the maximum supported size is {MAX_ANALYSIS_CELLS:,} "
-            f"(dimensions {width}x{height} at {resolution:g} m)."
+            f"(dimensions {width}x{height} at {target_resolution:g} m)."
         )
     destination = np.full((height, width), NODATA, dtype="float32")
     filled = np.zeros(destination.shape, dtype=bool)

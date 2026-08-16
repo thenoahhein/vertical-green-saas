@@ -12,6 +12,7 @@ from sitesense.hydrology import (
     WhiteboxBinaryError,
     _corridor_contributing_acres,
     assign_mapped_water_relationships,
+    boundary_inflow_mask,
     fetch_3dhp,
     fetch_wbd_membership,
     run_hydrology,
@@ -78,10 +79,18 @@ def test_reference_service_outage_is_typed(monkeypatch: pytest.MonkeyPatch) -> N
     class BrokenClient(Client):
         def get(self, url: str, **kwargs: Any) -> Response:
             raise OSError("offline")
-
     with pytest.raises(HydrologySourceError, match="failed"):
         fetch_3dhp((-97.32, 30.1, -97.3, 30.12), BrokenClient({}))
 
+
+def test_boundary_inflow_uses_d8_direction_not_boundary_accumulation() -> None:
+    outward = np.zeros((3, 3), dtype="float32")
+    outward[0, 1] = 4  # north, out of the top edge
+    assert not boundary_inflow_mask(outward)[0, 1]
+
+    inward = np.zeros((3, 3), dtype="float32")
+    inward[0, 1] = 64  # south, into the window from the top edge
+    assert boundary_inflow_mask(inward)[0, 1]
 
 def test_missing_whitebox_binary_is_typed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("sitesense.hydrology.whitebox_binary_path", lambda: (_ for _ in ()).throw(WhiteboxBinaryError("missing")))

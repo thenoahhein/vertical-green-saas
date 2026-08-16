@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,6 +29,8 @@ MIN_DEPRESSION_AREA_M2 = 9.0
 MIN_DEPRESSION_DEPTH_M = 0.3
 MIN_CATCHMENT_AREA_M2 = 100.0
 MIN_RIDGE_VALLEY_LENGTH_M = 1.0
+MAX_RETAINED_POLYGONS = 5_000
+MAX_RETAINED_LINES = 5_000
 HYDROGRAPHY_URL = (
     "https://3dhp.nationalmap.gov/arcgis/rest/services/usgs_3dhp_all/FeatureServer"
 )
@@ -79,6 +82,7 @@ class HydrologyResult:
     warnings: list[dict[str, object]]
     transform: Affine
     crs: str
+    stage_timings: dict[str, float]
 
 
 def whitebox_binary_path() -> Path:
@@ -217,11 +221,35 @@ def _corridor_contributing_acres(
     return float(np.max(values) * pixel_area / ACRE_SQUARE_METERS)
 
 
+def boundary_inflow_mask(flow_direction: np.ndarray) -> np.ndarray:
+    """Return boundary cells whose D8 pointer directs flow into the window."""
+    inward = np.zeros(flow_direction.shape, dtype=bool)
+    inward[0, :] |= np.isin(flow_direction[0, :], (32, 64, 128))
+    inward[-1, :] |= np.isin(flow_direction[-1, :], (2, 4, 8))
+    inward[:, 0] |= np.isin(flow_direction[:, 0], (1, 2, 128))
+    inward[:, -1] |= np.isin(flow_direction[:, -1], (8, 16, 32))
+    return inward
+
+
 def _filter_lines_by_length(
     lines: list[LineString | MultiLineString],
     minimum_length_m: float,
 ) -> list[LineString | MultiLineString]:
     return [line for line in lines if line.length >= minimum_length_m]
+
+
+def _cap_polygons(polygons: list[Polygon]) -> tuple[list[Polygon], bool]:
+    if len(polygons) <= MAX_RETAINED_POLYGONS:
+        return polygons, False
+    return sorted(polygons, key=lambda polygon: polygon.area, reverse=True)[:MAX_RETAINED_POLYGONS], True
+
+
+def _cap_lines(
+    lines: list[LineString | MultiLineString],
+) -> tuple[list[LineString | MultiLineString], bool]:
+    if len(lines) <= MAX_RETAINED_LINES:
+        return lines, False
+    return sorted(lines, key=lambda line: line.length, reverse=True)[:MAX_RETAINED_LINES], True
 
 
 def _depression_features(
@@ -330,6 +358,8 @@ def run_hydrology(
     inflow_threshold_cells: int = DEFAULT_WINDOW_INFLOW_THRESHOLD_CELLS,
 ) -> HydrologyResult:
     """Run the complete local routing workflow in a cleaned per-job directory."""
+    workflow_started = time.perf_counter()
+    stage_timings: dict[str, float] = {}
     binary_version = whitebox_binary_version()
     valid = valid_data_mask(elevation)
     if not valid.any():
@@ -337,6 +367,7 @@ def run_hydrology(
     nodata = -9999.0
     vectorization_method = "raster-cell-centerline"
     with tempfile.TemporaryDirectory(prefix="sitesense-hydrology-") as directory:
+        routing_started = time.perf_counter()
         root = Path(directory)
         dem = root / "dem.tif"
         conditioned_path = root / "conditioned.tif"
@@ -384,6 +415,7 @@ def run_hydrology(
             raise
         except (OSError, RuntimeError, ValueError) as exc:
             raise HydrologySourceError(f"WhiteboxTools hydrology failed: {exc}") from exc
+        stage_timings["whitebox_routing"] = time.perf_counter() - routing_started
         conditioned = _read_raster(conditioned_path)
         flow_direction = _read_raster(pointer_path)
         flow_accumulation = _read_raster(accumulation_path)
@@ -402,10 +434,11 @@ def run_hydrology(
     boundary = np.zeros(stream_mask.shape, dtype=bool)
     boundary[0, :] = boundary[-1, :] = True
     boundary[:, 0] = boundary[:, -1] = True
-    boundary_accumulation = flow_accumulation[
-        boundary & valid_data_mask(flow_accumulation, np.nan)
-    ]
-    inflow_cells = int((boundary_accumulation >= inflow_threshold_cells).sum())
+    boundary_valid = boundary & valid_data_mask(flow_accumulation, np.nan)
+    inflow = boundary_inflow_mask(flow_direction) & boundary_valid
+    boundary_accumulation = flow_accumulation[boundary_valid]
+    inflow_accumulation = flow_accumulation[inflow]
+    inflow_cells = int((inflow_accumulation >= inflow_threshold_cells).sum())
     max_boundary_accumulation = (
         int(np.nanmax(boundary_accumulation)) if boundary_accumulation.size else 0
     )
@@ -427,11 +460,13 @@ def run_hydrology(
                 "contributing_acres_is_lower_bound": True,
             }
         )
+    filtering_started = time.perf_counter()
     raw_catchments = [
         polygon
         for polygon in _vectorize_mask(subbasins, transform, lambda values: values > 0)
         if polygon.area >= MIN_CATCHMENT_AREA_M2
     ]
+    raw_catchments, catchments_capped = _cap_polygons(raw_catchments)
     valid_depth_cells = (
         valid_data_mask(conditioned, np.nan)
         & valid_data_mask(elevation, np.nan)
@@ -447,6 +482,7 @@ def run_hydrology(
     raw_depressions = _vectorize_mask(
         depression_depth, transform, lambda values: values >= MIN_DEPRESSION_DEPTH_M
     )
+    raw_depressions, depressions_capped = _cap_polygons(raw_depressions)
     catchments = raw_catchments
     depressions = _depression_features(
         raw_depressions, elevation, conditioned, transform, pixel_area
@@ -457,6 +493,18 @@ def run_hydrology(
     valleys = _filter_lines_by_length(
         _raster_mask_to_lines(valley_raster, transform), MIN_RIDGE_VALLEY_LENGTH_M
     )
+    ridgelines, ridges_capped = _cap_lines(ridgelines)
+    valleys, valleys_capped = _cap_lines(valleys)
+    if catchments_capped or depressions_capped or ridges_capped or valleys_capped:
+        warnings.append(
+            {
+                "code": "hydrology_products_capped",
+                "message": "Hydrology products exceeded the retained-feature cap; least significant features were omitted.",
+                "max_retained_polygons": MAX_RETAINED_POLYGONS,
+                "max_retained_lines": MAX_RETAINED_LINES,
+            }
+        )
+    stage_timings["vectorization_filtering"] = time.perf_counter() - filtering_started
     corridors: list[HydroCorridor] = []
     for line in drainage_lines:
         parcel_intersection = line.intersection(parcel_geometry)
@@ -480,6 +528,9 @@ def run_hydrology(
         "stream_threshold_cells": stream_threshold_cells,
         "window_boundary_inflow_cells": inflow_cells,
         "window_boundary_inflow_max_cells": max_boundary_accumulation,
+        "window_boundary_inflow_max_inward_cells": (
+            int(np.nanmax(inflow_accumulation)) if inflow_accumulation.size else 0
+        ),
         "window_truncated": truncated,
         "contributing_acres_within_window": local_contributing_acres,
         "contributing_acres_is_lower_bound": truncated,
@@ -501,7 +552,9 @@ def run_hydrology(
         "potential_water_management_review_required": True,
         "whitebox_binary_version": binary_version,
         "drainage_vectorization_method": vectorization_method,
+        "routing_resolution_m": abs(transform.a),
     }
+    stage_timings["hydrology_total"] = time.perf_counter() - workflow_started
     return HydrologyResult(
         conditioned=conditioned,
         flow_direction=flow_direction,
@@ -516,6 +569,7 @@ def run_hydrology(
         warnings=warnings,
         transform=transform,
         crs=crs,
+        stage_timings=stage_timings,
     )
 
 

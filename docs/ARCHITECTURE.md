@@ -200,6 +200,19 @@ rule is applied to terrain metrics, hydrology inputs, depression attributes,
 and COG output. The float32 sentinel is not valid elevation data merely
 because it passes `isfinite`.
 
+Hydrology expansion routing uses a 5 m grid while the local parcel window
+remains at source resolution. The routing resolution is recorded in metrics
+and layer metadata; coarse expansion rasters are not parcel-grade products.
+To bound pathological vectorization, at most 5,000 polygons and 5,000
+line features are retained per product family, ranked by area or length.
+When a cap applies, the analysis emits `hydrology_products_capped` rather
+than silently presenting an incomplete product set.
+
+Analysis job status records stage timings for source selection, mosaic reads,
+terrain derivatives, Whitebox routing, vectorization/filtering, reference
+queries, and persistence. The same timing data is included in persisted raster
+layer metadata where applicable.
+
 USGS 3DHP flowlines, waterbodies, and hydrolocations are stored as reference
 layers with independent provenance. Terrain-derived depressions and water
 features are labeled **potential water-management investigation areas** and

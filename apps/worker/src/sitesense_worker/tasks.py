@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import tempfile
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -187,7 +188,8 @@ def _select_products_with_cache(
         return TerrainSelection(
             selection.products,
             True,
-            f"TNMAccess catalog unavailable; cached product fallback used. {catalog_error}",
+            f"{selection.warning or 'terrain_catalog_unavailable_cached_product'} "
+            f"TNMAccess query failed: {catalog_error}",
         )
 
 
@@ -328,6 +330,8 @@ def _persist_hydrology(
                 "analysis_scope": "within analysis window",
                 "source_urls": list(contributors),
                 "whitebox_binary_version": hydrology.metrics["whitebox_binary_version"],
+                "routing_resolution_m": hydrology.metrics["routing_resolution_m"],
+                "stage_timings": hydrology.stage_timings,
             },
         )
         pending_layers.append(layer)
@@ -409,6 +413,8 @@ def _persist_hydrology(
                 "contributing_acres_is_lower_bound": bool(
                     hydrology.metrics["contributing_acres_is_lower_bound"]
                 ),
+                "routing_resolution_m": hydrology.metrics["routing_resolution_m"],
+                "stage_timings": hydrology.stage_timings,
             },
         )
     session.add_all(pending_layers)
@@ -505,7 +511,7 @@ def _persist_reference_layers(
     return warnings, mapped_geometries
 
 
-def _set_job(session: Session, job: Job, stage: JobStage, statuses: dict[str, str], detail: str | None = None) -> None:
+def _set_job(session: Session, job: Job, stage: JobStage, statuses: dict[str, Any], detail: str | None = None) -> None:
     job.stage = stage
     job.category_status = statuses
     job.error_detail = detail
@@ -517,6 +523,7 @@ def _set_job(session: Session, job: Job, stage: JobStage, statuses: dict[str, st
 
 
 def _terrain_analysis(session: Session, job: Job) -> None:
+    stage_timings: dict[str, float] = {}
     parcel = session.scalar(
         select(Parcel)
         .join(Property, Property.id == Parcel.property_id)
@@ -537,7 +544,9 @@ def _terrain_analysis(session: Session, job: Job) -> None:
         float(buffered_wgs84.bounds[2]),
         float(buffered_wgs84.bounds[3]),
     )
+    started = time.perf_counter()
     selection = _select_products_with_cache(session, buffered_bounds)
+    stage_timings["source_selection"] = time.perf_counter() - started
     sources = [_source_row(session, product) for product in selection.products]
     if not selection.products:
         analysis = SiteAnalysis(
@@ -569,13 +578,16 @@ def _terrain_analysis(session: Session, job: Job) -> None:
         )
         _set_job(session, job, JobStage.partial, {"terrain": "unavailable"}, selection.warning)
         return
+    started = time.perf_counter()
     elevation, grid_transform, grid_crs, contributors = read_mosaic(
         selection.products,
         buffered_bounds,
         "EPSG:26914",
     )
+    stage_timings["mosaic_read"] = time.perf_counter() - started
     contributor_sources = [source for source in sources if source.source_url in contributors]
     _set_job(session, job, JobStage.processing, {"terrain": "processing"})
+    started = time.perf_counter()
     result = analyze_elevation(
         elevation,
         grid_transform,
@@ -584,6 +596,7 @@ def _terrain_analysis(session: Session, job: Job) -> None:
         buffered_projected,
         parcel.computed_acres,
     )
+    stage_timings["terrain_derivatives"] = time.perf_counter() - started
     _set_job(session, job, JobStage.derivatives, {"terrain": "complete"})
     analysis = SiteAnalysis(
         organization_id=job.organization_id,
@@ -631,6 +644,7 @@ def _terrain_analysis(session: Session, job: Job) -> None:
                 "nodata": -3.4028230607370965e38,
                 "source_urls": contributors,
                 "catalog_warning": selection.warning,
+                "stage_timings": stage_timings,
             },
         )
         session.add(layer)
@@ -726,7 +740,9 @@ def _terrain_analysis(session: Session, job: Job) -> None:
             )
     hydrology_warnings: list[dict[str, object]] = []
     hydrology_buffer_meters = DEFAULT_TERRAIN_BUFFER_METERS
+    hydrology_stage_timings: dict[str, float] = {}
     try:
+        hydrology_started = time.perf_counter()
         hydrology_result = run_hydrology(
             elevation,
             grid_transform,
@@ -750,6 +766,7 @@ def _terrain_analysis(session: Session, job: Job) -> None:
                     expanded_selection.products,
                     expanded_bounds,
                     "EPSG:26914",
+                    resolution=5.0,
                 )
                 hydrology_result = run_hydrology(
                     expanded_elevation,
@@ -761,9 +778,12 @@ def _terrain_analysis(session: Session, job: Job) -> None:
                 buffered_projected = expanded_projected
                 buffered_bounds = expanded_bounds
                 contributors = expanded_contributors
+                hydrology_result.metrics["routing_resolution_m"] = abs(expanded_transform.a)
+                hydrology_result.metrics["expansion_routing_resolution_m"] = 5.0
                 for product in expanded_selection.products:
                     if product.source_url not in [source.source_url for source in sources]:
                         sources.append(_source_row(session, product))
+        reference_started = time.perf_counter()
         reference_warnings, mapped_geometries = _persist_reference_layers(
             session,
             job,
@@ -771,6 +791,7 @@ def _terrain_analysis(session: Session, job: Job) -> None:
             buffered_bounds,
             (float(source_geometry.centroid.x), float(source_geometry.centroid.y)),
         )
+        hydrology_stage_timings["reference_queries"] = time.perf_counter() - reference_started
         hydrology_warnings.extend(reference_warnings)
         projected_mapped_geometries = (
             None
@@ -778,6 +799,7 @@ def _terrain_analysis(session: Session, job: Job) -> None:
             else [transform(projector.transform, geometry) for geometry in mapped_geometries]
         )
         assign_mapped_water_relationships(hydrology_result, projected_mapped_geometries)
+        persistence_started = time.perf_counter()
         hydrology_warnings.extend(
             _persist_hydrology(
                 session,
@@ -792,6 +814,9 @@ def _terrain_analysis(session: Session, job: Job) -> None:
                 hydrology_buffer_meters,
             )
         )
+        hydrology_stage_timings.update(hydrology_result.stage_timings)
+        hydrology_stage_timings["persistence"] = time.perf_counter() - persistence_started
+        hydrology_stage_timings["hydrology_total_worker"] = time.perf_counter() - hydrology_started
     except HydrologySourceError as exc:
         hydrology_warnings.append({"code": "hydrology_unavailable", "message": str(exc)})
         session.add(
@@ -812,6 +837,7 @@ def _terrain_analysis(session: Session, job: Job) -> None:
         {
             "terrain": "complete",
             "hydrology": "partial" if hydrology_warnings else "complete",
+            "stage_timings": {**stage_timings, **hydrology_stage_timings},
         },
         "; ".join(
             str(warning.get("message"))
