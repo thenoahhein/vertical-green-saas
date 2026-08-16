@@ -16,7 +16,7 @@ export type ParcelCandidate = {
   owner: string | null;
   geometry: GeoJsonGeometry;
   raw_attributes: Record<string, unknown>;
-  distance_meters: number;
+  distance_meters: number | null;
   contains_point: boolean;
 };
 

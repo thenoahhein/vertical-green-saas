@@ -14,6 +14,7 @@ from shapely.geometry.base import BaseGeometry
 from sitesense.geo import acreage, project_for_length
 
 SOURCE_NAMESPACE = UUID("5a5bda8f-6d5e-4a9c-a75e-d4fb2dba4a72")
+SITUS_MATCH_MAX_DISTANCE_METERS = 5000
 _SEARCH_CACHE: dict[str, tuple[float, list[NormalizedParcel]]] = {}
 
 
@@ -99,7 +100,7 @@ class NormalizedParcel:
     owner: str | None
     geometry: BaseGeometry
     raw_attributes: dict[str, Any]
-    distance_meters: float = 0.0
+    distance_meters: float | None = None
     contains_point: bool = False
     situs_match: bool = False
 
@@ -108,8 +109,9 @@ class NormalizedParcel:
         return acreage(self.geometry)
 
 
-def _cache_key(point: Point, buffer_meters: float, address: str | None) -> str:
-    return f"{point.x:.6f}:{point.y:.6f}:{buffer_meters:.1f}:{normalize_situs(address or '')}"
+def _cache_key(point: Point | None, buffer_meters: float, address: str | None) -> str:
+    point_key = f"{point.x:.6f}:{point.y:.6f}" if point is not None else "address-only"
+    return f"{point_key}:{buffer_meters:.1f}:{normalize_situs(address or '')}"
 
 
 class ParcelSourceAdapter(Protocol):
@@ -117,7 +119,7 @@ class ParcelSourceAdapter(Protocol):
 
     async def search(
         self,
-        point: Point,
+        point: Point | None,
         buffer_meters: float = 1000,
         address: str | None = None,
     ) -> list[NormalizedParcel]:
@@ -156,30 +158,30 @@ class ArcGISParcelAdapter:
 
     async def search(
         self,
-        point: Point,
+        point: Point | None,
         buffer_meters: float = 1000,
         address: str | None = None,
     ) -> list[NormalizedParcel]:
-        # ArcGIS accepts WGS84 point queries. A small envelope around the point
-        # catches parcels straddling service/county boundaries without broad scans.
-        query_geometry = point.buffer(buffer_meters / 111_320) if buffer_meters else point
-        minx, miny, maxx, maxy = query_geometry.bounds
-        geometry = f"{minx},{miny},{maxx},{maxy}" if buffer_meters else f"{point.x},{point.y}"
         key = f"{self.source.county}:{_cache_key(point, buffer_meters, address)}"
         cached = _SEARCH_CACHE.get(key)
         if cached and cached[0] > time.monotonic():
             return cached[1]
-        spatial_params = {
-            "f": "json",
-            "where": "1=1",
-            "geometry": geometry,
-            "geometryType": "esriGeometryEnvelope" if buffer_meters else "esriGeometryPoint",
-            "inSR": "4326",
-            "spatialRel": "esriSpatialRelIntersects",
-            "outFields": "*",
-            "returnGeometry": "true",
-            "outSR": "4326",
-        }
+        spatial_params: dict[str, str] | None = None
+        if point is not None:
+            query_geometry = point.buffer(buffer_meters / 111_320) if buffer_meters else point
+            minx, miny, maxx, maxy = query_geometry.bounds
+            geometry = f"{minx},{miny},{maxx},{maxy}" if buffer_meters else f"{point.x},{point.y}"
+            spatial_params = {
+                "f": "json",
+                "where": "1=1",
+                "geometry": geometry,
+                "geometryType": "esriGeometryEnvelope" if buffer_meters else "esriGeometryPoint",
+                "inSR": "4326",
+                "spatialRel": "esriSpatialRelIntersects",
+                "outFields": "*",
+                "returnGeometry": "true",
+                "outSR": "4326",
+            }
         query = parse_situs_query(address) if address else None
         own_client = self.client is None
         client = self.client or httpx.AsyncClient(timeout=self.timeout)
@@ -187,12 +189,11 @@ class ArcGISParcelAdapter:
             last_error: Exception | None = None
             for attempt in range(3):
                 try:
-                    spatial = await self._query_pages(client, spatial_params, point)
+                    spatial = await self._query_pages(client, spatial_params) if spatial_params else []
                     attribute = (
                         await self._query_pages(
                             client,
                             self._attribute_params(query),
-                            point,
                         )
                         if query
                         else []
@@ -217,7 +218,6 @@ class ArcGISParcelAdapter:
         self,
         client: httpx.AsyncClient,
         params: dict[str, str],
-        point: Point,
     ) -> list[dict[str, Any]]:
         page_size = self.max_record_count
         offset = 0
@@ -269,13 +269,13 @@ class ArcGISParcelAdapter:
             if current is None:
                 merged[parcel.source_feature_id] = parcel
             else:
-                current.situs_match = True
+                current.situs_match = current.situs_match or parcel.situs_match
         return list(merged.values())
 
     def _normalize(
         self,
         feature: dict[str, Any],
-        point: Point,
+        point: Point | None,
         situs_match: bool = False,
     ) -> NormalizedParcel:
         attributes = feature.get("attributes") or {}
@@ -288,6 +288,14 @@ class ArcGISParcelAdapter:
         except (TypeError, ValueError):
             appraisal = None
         candidate_id = uuid5(SOURCE_NAMESPACE, f"{self.source.county}:{source_feature_id}")
+        distance_meters = (
+            project_for_length(point).distance(project_for_length(geometry))
+            if point is not None
+            else None
+        )
+        situs_match = situs_match and (
+            distance_meters is None or distance_meters <= SITUS_MATCH_MAX_DISTANCE_METERS
+        )
         return NormalizedParcel(
             candidate_id=candidate_id,
             county=self.source.county,
@@ -300,19 +308,20 @@ class ArcGISParcelAdapter:
             owner=_text(attributes, (mapping.owner,)),
             geometry=geometry,
             raw_attributes=attributes,
-            distance_meters=project_for_length(point).distance(project_for_length(geometry)),
-            contains_point=geometry.covers(point),
+            distance_meters=distance_meters,
+            contains_point=geometry.covers(point) if point is not None else False,
             situs_match=situs_match,
         )
 
 
 async def search_counties(
-    point: Point,
+    point: Point | None,
     county: str | None = None,
     buffer_meters: float = 1000,
     address: str | None = None,
     adapters: tuple[ParcelSourceAdapter, ...] | None = None,
     health: dict[str, str] | None = None,
+    limit: int = 10,
 ) -> list[NormalizedParcel]:
     supported_county = next(
         (
@@ -352,8 +361,13 @@ async def search_counties(
             unique[key] = parcel
     return sorted(
         unique.values(),
-        key=lambda parcel: (not parcel.situs_match, not parcel.contains_point, parcel.distance_meters),
-    )[:10]
+        key=lambda parcel: (
+            not parcel.situs_match,
+            not parcel.contains_point,
+            parcel.distance_meters is None,
+            parcel.distance_meters or 0,
+        ),
+    )[: max(0, limit)]
 
 
 def source_for_url(url: str) -> CountySource | None:

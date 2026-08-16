@@ -7,6 +7,7 @@ import pytest
 from shapely.geometry import MultiPolygon, Point, Polygon
 from sitesense.parcel_sources import (
     COUNTY_SOURCES,
+    SITUS_MATCH_MAX_DISTANCE_METERS,
     ArcGISParcelAdapter,
     NormalizedParcel,
     SitusQuery,
@@ -99,6 +100,16 @@ def test_attribute_query_escapes_quotes() -> None:
     assert "O''BRIEN" in params["where"]
 
 
+def test_address_only_normalization_has_no_fabricated_distance() -> None:
+    feature = {
+        "attributes": {"ObjectID_1": "1", "prop_id_text": "1"},
+        "geometry": {"rings": [[[-97, 30], [-97, 30.001], [-96.999, 30.001], [-96.999, 30], [-97, 30]]]},
+    }
+    parcel = ArcGISParcelAdapter(COUNTY_SOURCES[0])._normalize(feature, None, situs_match=True)
+    assert parcel.distance_meters is None
+    assert parcel.contains_point is False
+
+
 def test_polygon_distance_and_situs_match_rank_before_centroid() -> None:
     point = Point(0, 0)
     large = MultiPolygon([Polygon([(-0.01, -0.01), (-0.01, 0.01), (0.01, 0.01), (0.01, -0.01), (-0.01, -0.01)])])
@@ -130,6 +141,39 @@ def test_situs_match_ranks_above_spatial_only() -> None:
 
     result = asyncio.run(search_counties(point, address="12 Main St", adapters=(FakeAdapter(),)))
     assert result[0].source_feature_id == "situs"
+
+
+def test_far_situs_match_does_not_beat_containing_parcel() -> None:
+    point = Point(0, 0)
+    containing = point.buffer(0.01)
+    far = Polygon([(0.1, 0.1), (0.1, 0.101), (0.101, 0.101), (0.101, 0.1), (0.1, 0.1)])
+
+    class FakeAdapter:
+        source = COUNTY_SOURCES[0]
+
+        async def search(self, point: Point, buffer_meters: float, address: str) -> list[NormalizedParcel]:
+            return [
+                NormalizedParcel(
+                    UUID(int=31), "Bastrop", "source", "far", "far", None, None, None, None,
+                    far, {}, SITUS_MATCH_MAX_DISTANCE_METERS + 1, False, False,
+                ),
+                NormalizedParcel(
+                    UUID(int=32), "Bastrop", "source", "inside", "inside", None, None, None, None,
+                    containing, {}, 0, True, False,
+                ),
+            ]
+
+    result = asyncio.run(search_counties(point, address="12 Main St", adapters=(FakeAdapter(),)))
+    assert result[0].source_feature_id == "inside"
+
+    far_feature = {
+        "attributes": {"ObjectID_1": "far", "prop_id_text": "far"},
+        "geometry": {
+            "rings": [[[0.1, 0.1], [0.1, 0.101], [0.101, 0.101], [0.101, 0.1], [0.1, 0.1]]]
+        },
+    }
+    guarded = ArcGISParcelAdapter(COUNTY_SOURCES[0])._normalize(far_feature, point, situs_match=True)
+    assert guarded.situs_match is False
 
 
 def test_unsupported_county_fans_out_to_all_sources() -> None:

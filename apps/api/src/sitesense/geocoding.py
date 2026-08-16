@@ -18,7 +18,6 @@ class GeocodedAddress:
     latitude: float
     longitude: float
     matched_address: str | None
-    county: str | None = None
 
 
 async def geocode(address: str, client: httpx.AsyncClient | None = None) -> GeocodedAddress:
@@ -41,7 +40,6 @@ async def geocode(address: str, client: httpx.AsyncClient | None = None) -> Geoc
                     latitude=float(coordinates["y"]),
                     longitude=float(coordinates["x"]),
                     matched_address=match.get("matchedAddress"),
-                    county=None,
                 )
             except (httpx.HTTPError, KeyError, TypeError, ValueError):
                 if attempt == 2:

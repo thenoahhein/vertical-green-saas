@@ -49,7 +49,7 @@ class ParcelCandidate(BaseModel):
     owner: str | None = None
     geometry: dict[str, object]
     raw_attributes: dict[str, object] = Field(default_factory=dict)
-    distance_meters: float = 0
+    distance_meters: float | None = None
     contains_point: bool = False
 
 

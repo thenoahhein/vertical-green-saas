@@ -1,5 +1,6 @@
 from uuid import UUID
 
+import pytest
 from fastapi.testclient import TestClient
 from shapely.geometry import MultiPolygon, Polygon
 from sitesense.disclaimers import DISCLAIMERS
@@ -112,6 +113,38 @@ def test_geocoder_no_match_is_typed_not_validation_error(monkeypatch) -> None:
         raise GeocoderNoMatch("no match")
 
     monkeypatch.setattr(parcels, "geocode", unavailable)
+    async def no_candidates(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr(parcels, "search_counties", no_candidates)
     response = TestClient(app).get("/api/parcel-search?address=not-a-real-address", headers=_headers())
     assert response.status_code == 404
     assert response.json()["detail"]["code"] == "address_not_found"
+
+
+def test_geocoder_no_match_falls_back_to_address_only_candidates(monkeypatch) -> None:
+    async def unavailable(_address: str):
+        raise GeocoderNoMatch("no match")
+
+    async def address_search(*args, **kwargs):
+        assert args[0] is None
+        assert kwargs["address"] == "4664 PIN OAK BRANCH RD, La Grange, TX"
+        candidate = _candidate()
+        candidate.contains_point = False
+        candidate.distance_meters = None
+        return [candidate]
+
+    monkeypatch.setattr(parcels, "geocode", unavailable)
+    monkeypatch.setattr(parcels, "search_counties", address_search)
+    response = TestClient(app).get(
+        "/api/parcel-search?address=4664%20PIN%20OAK%20BRANCH%20RD%2C%20La%20Grange%2C%20TX",
+        headers=_headers(),
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["geocoder_failed"] is True
+    assert payload["matched_address"] is None
+    assert payload["latitude"] == pytest.approx(30.0005)
+    assert payload["longitude"] == pytest.approx(-96.9995)
+    assert payload["candidates"][0]["distance_meters"] is None
+    assert payload["candidates"][0]["contains_point"] is False

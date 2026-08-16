@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import cast
 from uuid import UUID
@@ -80,18 +81,40 @@ async def parcel_search(
         if not address:
             raise HTTPException(status_code=422, detail="Provide address or latitude and longitude")
         try:
-            result = await geocode(address)
+            result, county = await asyncio.gather(geocode(address), resolve_county(address))
             latitude, longitude = result.latitude, result.longitude
             matched_address = result.matched_address
-            county = await resolve_county(address)
         except GeocoderNoMatch as exc:
-            raise HTTPException(
-                status_code=404,
-                detail={
-                    "code": "address_not_found",
-                    "message": "Address was not found; place a point on the map or provide latitude and longitude.",
-                },
-            ) from exc
+            fallback_health: dict[str, str] = {}
+            candidates = await search_counties(
+                None,
+                buffer_meters=0,
+                address=address,
+                health=fallback_health,
+            )
+            if not candidates:
+                raise HTTPException(
+                    status_code=404,
+                    detail={
+                        "code": "address_not_found",
+                        "message": "Address was not found; place a point on the map or provide latitude and longitude.",
+                    },
+                ) from exc
+            centroid = candidates[0].geometry.centroid
+            latitude, longitude = centroid.y, centroid.x
+            geocoder_failed = True
+            return ParcelSearchResponse(
+                candidates=[_candidate(parcel) for parcel in candidates],
+                latitude=latitude,
+                longitude=longitude,
+                matched_address=None,
+                geocoder_failed=geocoder_failed,
+                source_health=[
+                    {"county": source_county, "status": value.split(":", 1)[0], **({"reason": value.split(":", 1)[1]} if ":" in value else {})}
+                    for source_county, value in fallback_health.items()
+                ],
+                disclaimer=DISCLAIMERS["parcel_boundary"],
+            )
         except Exception as exc:
             geocoder_failed = True
             raise HTTPException(
