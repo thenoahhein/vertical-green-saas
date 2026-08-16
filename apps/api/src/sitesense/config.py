@@ -12,6 +12,8 @@ class Settings(BaseSettings):
     dev_user_id: str = "00000000-0000-0000-0000-000000000002"
     object_store_endpoint: str = "http://localhost:9000"
     object_store_bucket: str = "sitesense"
+    object_store_access_key: str = "minio"
+    object_store_secret_key: str = "miniopassword"
     cors_allowed_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
 
     def allowed_origins(self) -> list[str]:

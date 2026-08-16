@@ -94,3 +94,140 @@ Fixtures drive normal tests. `scripts/live_source_health.py` is an explicit
 opt-in check for upstream availability and is excluded from CI.
 
 TxGIO StratMap statewide parcels is bulk-download-only: its public MapServer `/query` capability is disabled. Launch-county parcel adapters use the verified ArcGIS FeatureServers (layer 0) for Bastrop, Lee, Fayette, and Caldwell. USGS 3DEP uses public `prd-tnm` staged COGs / TNMAccess; USDA Soil Data Access requires POST; TWDB, FEMA NFHL, and USFWS NWI are registered as ArcGIS services.
+
+## Terrain analysis
+
+Terrain is the first payload of the asynchronous analysis pipeline. A confirmed
+parcel analysis queries TNMAccess for products intersecting the parcel plus a
+configurable 500-meter buffer, prefers complete 1-meter 3DEP coverage, and
+falls back to 1/3 arc-second DEM coverage when required. Product metadata is
+stored in `data_sources`; every raster or contour layer records
+`analysis_source_refs` back to the selected product rows.
+
+Derivatives run on a projected metre grid after all intersecting COG windows
+have been mosaicked. NumPy implements Horn 3x3 slope, aspect, and hillshade
+derivatives. Raw elevation remains the raster basis, while reported slope
+statistics use a 3x3 focal-mean-smoothed elevation surface to produce a
+planning-grade contractor metric. The slope histogram reports acreage from
+parcel pixels and percentages of valid parcel slope pixels; the payload names
+that denominator explicitly. Elevations are stored in metres and payloads also
+expose contractor-facing feet values. Contours use matplotlib, a 2-foot
+interval at 1-meter source resolution (5 feet otherwise), and are stored as
+per-level 4326 geometries with elevation-in-feet and 10-foot index metadata.
+
+Terrain rasters are written as COGs to the S3-compatible object store under
+organization/project/analysis-scoped keys. Coverage below 99 percent produces
+a typed warning naming the missing fraction; zero valid parcel coverage
+produces a typed source-unavailable warning while the job remains partial.
+
+Hydrologically conditioned terrain products are intentionally not part of this
+milestone. Local depressions, ridgelines, valleys, and terrain-derived drainage
+networks require flow routing and belong to Milestone 3.
+
+## Hydrology analysis
+
+Milestone 3 extends the terrain job with WhiteboxTools 2.3.6. The API and
+worker images warm the MIT-licensed executable during image build; request
+processing fails with a typed configuration error if the executable is absent
+and never downloads it on demand. The measured Whitebox workflow was 0.64
+seconds and approximately 69 MB for a 1,402-by-1,402 window, versus 1.14
+seconds and approximately 103 MB for a 1,900-by-1,900 window. PySheds was
+approximately ten times slower and five times more memory-intensive in the
+same probe, and its accumulation path currently calls the removed NumPy 2.5
+`in1d` symbol. RichDEM does not build on Python 3.12. A straightforward
+Python priority-flood implementation alone took approximately 32 seconds on
+2,000-by-2,000 cells, so it is not used in the request path.
+
+Hydrology rasters are staged in a cleaned per-job directory because
+WhiteboxTools uses file paths: conditioned DEM, D8 pointer, D8 accumulation,
+stream raster, and local subbasins are persisted as COGs or vector layers.
+Drainage extraction uses an explicit accumulation threshold recorded in layer
+metadata. Depressions, ridgelines, valleys, catchments, and corridor
+statistics are local-window products and are not authoritative watershed
+delineations.
+
+The D8 accumulation operation is explicitly invoked with Whitebox's `pntr`
+flag because its input is the D8 pointer raster, not an elevation raster.
+Accumulation output is therefore measured in cells (`out_type=cells`), but the
+stream threshold is specified as a contributing area rather than a cell count.
+The default is 8,093.7 m² (2 acres), a contractor-scale channel screening
+threshold for Central Texas landscapes. It is converted to the smallest
+whole-cell count that meets that area on each routing grid and both the area
+threshold and applied cell count are recorded in layer metadata. Thus the
+10-meter expansion uses 81 cells for the same 2-acre threshold, while the
+1-meter local grid uses 8,094 cells.
+
+Hydrology products are filtered rather than dissolved into a single geometry.
+The named defaults for 1-meter lidar are:
+
+- depressions: minimum 9 m² area and 0.3 m maximum fill depth;
+- local catchments: minimum 100 m² area;
+- ridgelines and major valleys: minimum 1 m centerline length (one DEM cell).
+
+Each retained depression is persisted separately with fill depth and an
+estimated filled volume. Each retained catchment remains a partition feature,
+and each retained ridge/valley remains a centerline feature. Multipart
+geometries expose their part counts in metrics and layer metadata rather than
+being mistaken for one simple feature. Applied minimums are recorded in layer
+metadata, so omitted small features are distinguishable from missing analysis
+output. Raster masks for ridges and valleys are traced
+through cell centers and filtered by length; polygon boundaries are never used
+as their line representation.
+
+Corridor contributing acreage is calculated independently for each extracted
+drainage corridor from the maximum accumulation cells along that corridor.
+Parcel intersection is reported as corridor length inside the parcel, in
+contractor-facing feet with the metric length retained in layer metadata.
+Mapped-water relationships are classified against 3DHP flowlines and
+waterbodies within a 30-meter tolerance; an unavailable 3DHP query is reported
+as unavailable rather than as an absence of mapped hydrography. Whitebox
+stream vectorization is read from its Shapefile output when present. The
+fallback traces active raster cells through their centers, avoiding the
+doubled outlines produced by polygon-mask boundaries.
+
+The actual warmed WhiteboxTools executable version is recorded with each
+hydrology raster layer, independently of the Python wrapper version, so
+algorithm provenance remains traceable.
+
+Contributing acreage is always labeled `within analysis window`. Boundary
+inflow is detected from accumulation values at the analysis-window edge. When
+significant inflow is present, the value is a lower bound and the payload
+emits `hydrology_window_truncated`; one bounded expansion from the default
+500-meter buffer to 2 kilometers is attempted only for a real accumulation
+inflow signal. Analysis grids are capped at 9,000,000 cells so the expansion
+cannot silently allocate an unbounded raster; oversized requests degrade with
+a typed terrain-source error. The system never publishes a bare parcel-scale
+watershed acreage from a local window. WBD HUC10/HUC12
+membership is regional context only, and the absence of a local 3DHP
+Catchment feature is recorded as unavailable rather than treated as proof of
+no upstream watershed.
+
+All raster products use one nodata validity rule: a cell must be finite and
+different from the declared nodata value within a numeric tolerance. This
+rule is applied to terrain metrics, hydrology inputs, depression attributes,
+and COG output. The float32 sentinel is not valid elevation data merely
+because it passes `isfinite`.
+
+Hydrology expansion routing uses a 10 m grid while the local parcel window
+remains at source resolution. The routing resolution is recorded in metrics
+and layer metadata; coarse expansion rasters are not parcel-grade products.
+When expansion is required, parcel products and parcel-intersecting corridors
+remain sourced from the local run, while contributing-area metrics and the
+wider context drainage network come from the expanded run. Persisted layers
+identify their local or coarse-context window and routing resolution.
+To bound pathological vectorization, at most 5,000 polygons and 5,000
+line features are retained per product family, ranked by area or length.
+When a cap applies, the analysis emits `hydrology_products_capped` rather
+than silently presenting an incomplete product set.
+
+Analysis job status records stage timings for source selection, mosaic reads,
+terrain derivatives, Whitebox routing, vectorization/filtering, reference
+queries, persistence, and each expanded-window source selection, mosaic read,
+and hydrology pass. The same timing data is included in persisted raster layer
+metadata where applicable.
+
+USGS 3DHP flowlines, waterbodies, and hydrolocations are stored as reference
+layers with independent provenance. Terrain-derived depressions and water
+features are labeled **potential water-management investigation areas** and
+require contractor review; the analysis does not recommend building a pond or
+other feature.

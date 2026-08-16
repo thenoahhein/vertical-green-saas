@@ -1,8 +1,63 @@
+from __future__ import annotations
+
+import io
+import json
+import tempfile
+import time
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any, cast
+from uuid import UUID
+
+import boto3
+import numpy as np
+import rasterio
 from celery import Celery
+from geoalchemy2.elements import WKBElement
+from geoalchemy2.shape import from_shape, to_shape
+from pyproj import Transformer
+from rasterio.shutil import copy as copy_raster
+from shapely.ops import transform
 from sitesense.config import get_settings
+from sitesense.hydrology import (
+    HYDROGRAPHY_URL,
+    WBD_URL,
+    HydrologySourceError,
+    assign_mapped_water_relationships,
+    feature_geometries,
+    fetch_3dhp,
+    fetch_wbd_membership,
+    merge_context_metrics,
+    run_hydrology,
+)
 from sitesense.jobs import transition_job
-from sitesense.models import JobStage
-from sqlalchemy import create_engine
+from sitesense.models import (
+    AnalysisCategory,
+    AnalysisLayer,
+    AnalysisSourceRef,
+    CategoryStatus,
+    Confidence,
+    DataSource,
+    DerivedMetric,
+    Job,
+    JobStage,
+    Parcel,
+    Property,
+    SiteAnalysis,
+)
+from sitesense.terrain import (
+    DEFAULT_TERRAIN_BUFFER_METERS,
+    TerrainProduct,
+    TerrainSelection,
+    TerrainSourceError,
+    analyze_elevation,
+    cached_products_for_bounds,
+    read_mosaic,
+    select_products,
+    valid_data_mask,
+)
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import Session
 
 settings = get_settings()
 celery_app = Celery("sitesense", broker=settings.redis_url, backend=settings.redis_url)
@@ -15,9 +70,922 @@ def configure_database(database_url: str) -> None:
     engine = create_engine(database_url)
 
 
-@celery_app.task(name="sitesense.noop_analysis")  # type: ignore[untyped-decorator]
+def _object_store() -> Any:
+    return boto3.client(
+        "s3",
+        endpoint_url=settings.object_store_endpoint,
+        aws_access_key_id=settings.object_store_access_key,
+        aws_secret_access_key=settings.object_store_secret_key,
+        region_name="us-east-1",
+    )
+
+
+def _write_cog(array: np.ndarray, transform_: Any, crs: str, nodata: float) -> bytes:
+    safe_array = np.where(valid_data_mask(array, nodata), array, nodata).astype("float32")
+    with tempfile.TemporaryDirectory() as directory:
+        source_path = Path(directory) / "source.tif"
+        output_path = Path(directory) / "output.tif"
+        with rasterio.open(
+            source_path,
+            "w",
+            driver="GTiff",
+            height=array.shape[0],
+            width=array.shape[1],
+            count=1,
+            dtype="float32",
+            crs=crs,
+            transform=transform_,
+            nodata=nodata,
+            tiled=True,
+            blockxsize=256,
+            blockysize=256,
+            compress="DEFLATE",
+        ) as dataset:
+            dataset.write(safe_array, 1)
+        copy_raster(source_path, output_path, driver="COG", compress="DEFLATE", overview_resampling="average")
+        content = output_path.read_bytes()
+        with rasterio.MemoryFile(content).open() as dataset:
+            values = dataset.read(1, masked=True)
+            if not values.count():
+                raise ValueError("COG output contains no valid raster cells.")
+        return content
+
+
+def _upload(key: str, content: bytes) -> None:
+    _object_store().put_object(
+        Bucket=settings.object_store_bucket,
+        Key=key,
+        Body=io.BytesIO(content),
+        ContentType="image/tiff",
+    )
+
+
+def _source_row(session: Session, product: Any) -> DataSource:
+    source = session.scalar(select(DataSource).where(DataSource.source_url == product.source_url))
+    if source is None:
+        source = DataSource(
+            name=f"USGS 3DEP {product.title}",
+            agency="USGS",
+            dataset_name=product.dataset_name,
+            source_url=product.source_url,
+            access_method="tnmaccess-cog",
+            version=product.published_at.isoformat() if product.published_at else None,
+            published_at=product.published_at,
+            retrieved_at=datetime.now(UTC),
+            spatial_resolution=product.spatial_resolution,
+            notes=json.dumps(
+                {
+                    "product_bounds": list(product.bounds),
+                    "title": product.title,
+                    "catalog": "TNMAccess",
+                }
+            ),
+        )
+        session.add(source)
+        session.flush()
+    return source
+
+
+def _cached_selection(
+    session: Session,
+    bbox: tuple[float, float, float, float],
+) -> TerrainSelection:
+    cached: list[TerrainProduct] = []
+    rows = session.scalars(
+        select(DataSource).where(DataSource.dataset_name == "Digital Elevation Model (DEM) 1 meter")
+    )
+    for row in rows:
+        if not row.notes:
+            continue
+        try:
+            metadata = json.loads(row.notes)
+            bounds = tuple(float(value) for value in metadata["product_bounds"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        cached.append(
+            TerrainProduct(
+                title=row.name,
+                dataset_name=row.dataset_name,
+                source_url=row.source_url,
+                bounds=bounds,  # type: ignore[arg-type]
+                spatial_resolution=row.spatial_resolution or "1 m",
+                published_at=row.published_at,
+                byte_size=None,
+            )
+        )
+    return cached_products_for_bounds(tuple(cached), bbox)
+
+
+def _select_products_with_cache(
+    session: Session,
+    bbox: tuple[float, float, float, float],
+) -> TerrainSelection:
+    try:
+        return select_products(bbox)
+    except TerrainSourceError as catalog_error:
+        selection = _cached_selection(session, bbox)
+        if not selection.products:
+            raise catalog_error
+        return TerrainSelection(
+            selection.products,
+            True,
+            f"{selection.warning or 'terrain_catalog_unavailable_cached_product'} "
+            f"TNMAccess query failed: {catalog_error}",
+        )
+
+
+def _reference_source_row(
+    session: Session,
+    *,
+    name: str,
+    agency: str,
+    dataset_name: str,
+    source_url: str,
+    access_method: str,
+    notes: str,
+) -> DataSource:
+    source = session.scalar(select(DataSource).where(DataSource.source_url == source_url))
+    if source is None:
+        source = DataSource(
+            name=name,
+            agency=agency,
+            dataset_name=dataset_name,
+            source_url=source_url,
+            access_method=access_method,
+            retrieved_at=datetime.now(UTC),
+            notes=notes,
+        )
+        session.add(source)
+        session.flush()
+    return source
+
+
+def _source_ref(session: Session, organization_id: Any, source: DataSource, table: str, derived_id: Any) -> None:
+    session.add(
+        AnalysisSourceRef(
+            organization_id=organization_id,
+            data_source_id=source.id,
+            derived_table=table,
+            derived_id=derived_id,
+        )
+    )
+
+
+def _persist_hydrology(
+    session: Session,
+    job: Job,
+    analysis: SiteAnalysis,
+    parcel: Parcel,
+    parcel_projected: Any,
+    inverse: Transformer,
+    hydrology: Any,
+    contributors: tuple[str, ...],
+    buffer_geometry: Any,
+    analysis_buffer_meters: float,
+    context_hydrology: Any | None = None,
+    context_contributors: tuple[str, ...] = (),
+    context_buffer_geometry: Any | None = None,
+    context_buffer_meters: float = 0.0,
+) -> list[dict[str, object]]:
+    """Persist local parcel products and optional coarse context products."""
+    context = context_hydrology or hydrology
+    context_geometry = context_buffer_geometry or buffer_geometry
+    object_prefix = f"{job.organization_id}/{job.project_id}/analysis/{analysis.id}"
+    category = AnalysisCategory(
+        organization_id=job.organization_id,
+        analysis_id=analysis.id,
+        category="hydrology",
+        status=CategoryStatus.complete,
+        confidence=Confidence.medium if hydrology.warnings else Confidence.high,
+        confidence_reason=(
+            "WhiteboxTools D8 routing scoped to the recorded analysis window."
+            + (" Boundary inflow makes contributing acreage a lower bound." if hydrology.warnings else "")
+        ),
+    )
+    session.add(category)
+    session.flush()
+    units = {
+        "analysis_window_pixel_area_m2": "square_metres",
+        "stream_threshold_cells": "cells",
+        "stream_threshold_area_m2": "square_metres",
+        "window_boundary_inflow_cells": "cells",
+        "window_boundary_inflow_max_cells": "cells",
+        "contributing_acres_within_window": "acres",
+        "parcel_acres": "acres",
+        "local_depression_count": "count",
+        "ridge_segment_count": "count",
+        "valley_segment_count": "count",
+        "drainage_line_count": "count",
+        "catchment_count": "count",
+        "filtered_depression_count": "count",
+        "filtered_catchment_count": "count",
+        "depression_min_area_m2": "square_metres",
+        "depression_min_depth_m": "metres",
+        "catchment_min_area_m2": "square_metres",
+        "ridge_valley_min_length_m": "metres",
+        "valid_cell_count": "cells",
+        "max_flow_accumulation_cells": "cells",
+    }
+    metric_values = dict(hydrology.metrics)
+    if context_hydrology is not None:
+        metric_values = merge_context_metrics(hydrology.metrics, context.metrics)
+    for name, value in metric_values.items():
+        if value is None or not isinstance(value, (bool, int, float)):
+            continue
+        session.add(
+            DerivedMetric(
+                organization_id=job.organization_id,
+                analysis_id=analysis.id,
+                category="hydrology",
+                name=name,
+                value=float(value),
+                unit="boolean" if isinstance(value, bool) else units.get(name, "number"),
+            )
+        )
+    if hydrology.warnings:
+        session.add(
+            DerivedMetric(
+                organization_id=job.organization_id,
+                analysis_id=analysis.id,
+                category="hydrology",
+                name="window_truncation_warning",
+                value=1.0,
+                unit="boolean",
+            )
+        )
+    raster_outputs = {
+        "hydrology_conditioned_dem": (context.conditioned, context),
+        "hydrology_flow_direction": (context.flow_direction, context),
+        "hydrology_flow_accumulation": (context.flow_accumulation, context),
+        "hydrology_local_conditioned_dem": (hydrology.conditioned, hydrology),
+        "hydrology_local_flow_direction": (hydrology.flow_direction, hydrology),
+        "hydrology_local_flow_accumulation": (hydrology.flow_accumulation, hydrology),
+    }
+    all_contributors = tuple(dict.fromkeys((*contributors, *context_contributors)))
+    source_rows = list(
+        session.scalars(select(DataSource).where(DataSource.source_url.in_(all_contributors)))
+    )
+    pending_layers: list[AnalysisLayer] = []
+    for layer_name, (array, raster_hydrology) in raster_outputs.items():
+        key = f"{object_prefix}/{layer_name}.tif"
+        output_nodata = -9999.0
+        output = np.where(valid_data_mask(array, output_nodata), array, output_nodata)
+        _upload(
+            key,
+            _write_cog(
+                output,
+                raster_hydrology.transform,
+                raster_hydrology.crs,
+                output_nodata,
+            ),
+        )
+        layer = AnalysisLayer(
+            organization_id=job.organization_id,
+            analysis_id=analysis.id,
+            category=layer_name,
+            object_store_key=key,
+            layer_metadata={
+                "bounds": list(
+                    context_geometry.bounds
+                    if raster_hydrology is context
+                    else buffer_geometry.bounds
+                ),
+                "crs": raster_hydrology.crs,
+                "resolution_m": abs(raster_hydrology.transform.a),
+                "nodata": -9999.0,
+                "analysis_window_buffer_m": (
+                    context_buffer_meters if raster_hydrology is context else analysis_buffer_meters
+                ),
+                "analysis_scope": (
+                    "coarse expanded context window"
+                    if raster_hydrology is context and context_hydrology is not None
+                    else "parcel local window"
+                ),
+                "source_urls": list(
+                    context_contributors if raster_hydrology is context else contributors
+                ),
+                "whitebox_binary_version": raster_hydrology.metrics[
+                    "whitebox_binary_version"
+                ],
+                "routing_resolution_m": raster_hydrology.metrics["routing_resolution_m"],
+                "stage_timings": (
+                    context.stage_timings if raster_hydrology is context else hydrology.stage_timings
+                ),
+            },
+        )
+        pending_layers.append(layer)
+
+    def add_geometry_layer(category_name: str, geometry: Any, metadata: dict[str, object]) -> None:
+        projected = transform(inverse.transform, geometry)
+        pending_layers.append(
+            AnalysisLayer(
+            organization_id=job.organization_id,
+            analysis_id=analysis.id,
+            category=category_name,
+            geometry=from_shape(projected, srid=4326),
+            layer_metadata=metadata,
+            )
+        )
+
+    for line in hydrology.drainage_lines:
+        add_geometry_layer(
+            "hydrology_drainage_lines",
+            line,
+            {
+                "threshold_cells": hydrology.metrics["stream_threshold_cells"],
+                "threshold_area_m2": hydrology.metrics["stream_threshold_area_m2"],
+                "analysis_scope": "parcel local window",
+                "routing_resolution_m": hydrology.metrics["routing_resolution_m"],
+                "potential_water_management_review_required": True,
+                "vectorization_method": hydrology.metrics["drainage_vectorization_method"],
+            },
+        )
+    for polygon in hydrology.catchments:
+        add_geometry_layer(
+            "hydrology_local_catchments",
+            polygon,
+            {
+                "analysis_scope": "parcel local window",
+                "routing_resolution_m": hydrology.metrics["routing_resolution_m"],
+                "minimum_area_m2": hydrology.metrics["catchment_min_area_m2"],
+                "part_count": len(polygon.geoms) if polygon.geom_type == "MultiPolygon" else 1,
+            },
+        )
+    for depression in hydrology.depressions:
+        add_geometry_layer(
+            "hydrology_local_depressions",
+            depression.geometry,
+            {
+                "label": "potential water-management investigation area",
+                "analysis_scope": "parcel local window",
+                "requires_contractor_review": True,
+                "minimum_area_m2": hydrology.metrics["depression_min_area_m2"],
+                "minimum_depth_m": hydrology.metrics["depression_min_depth_m"],
+                "depth_m": depression.depth_m,
+                "volume_m3": depression.volume_m3,
+                "routing_resolution_m": hydrology.metrics["routing_resolution_m"],
+            },
+        )
+    for line in hydrology.ridgelines:
+        add_geometry_layer(
+            "hydrology_ridgelines",
+            line,
+            {
+                "requires_contractor_review": True,
+                "analysis_scope": "parcel local window",
+                "minimum_length_m": hydrology.metrics["ridge_valley_min_length_m"],
+                "part_count": len(line.geoms) if line.geom_type == "MultiLineString" else 1,
+                "routing_resolution_m": hydrology.metrics["routing_resolution_m"],
+            },
+        )
+    for line in hydrology.valleys:
+        add_geometry_layer(
+            "hydrology_major_valleys",
+            line,
+            {
+                "requires_contractor_review": True,
+                "analysis_scope": "parcel local window",
+                "minimum_length_m": hydrology.metrics["ridge_valley_min_length_m"],
+                "part_count": len(line.geoms) if line.geom_type == "MultiLineString" else 1,
+                "routing_resolution_m": hydrology.metrics["routing_resolution_m"],
+            },
+        )
+    for corridor in hydrology.corridors:
+        if corridor.parcel_length_m <= 0:
+            continue
+        add_geometry_layer(
+            "hydrology_corridors",
+            corridor.geometry,
+            {
+                "contributing_acres_within_window": corridor.contributing_acres,
+                "analysis_scope": "parcel local window",
+                "parcel_length_ft": corridor.parcel_length_m * 3.280839895,
+                "parcel_length_m": corridor.parcel_length_m,
+                "flow_direction_degrees": corridor.flow_direction_degrees,
+                "mapped_water_relationship": corridor.mapped_water_relationship,
+                "mapped_water_tolerance_m": hydrology.metrics["mapped_water_tolerance_m"],
+                "contributing_acres_is_lower_bound": bool(
+                    hydrology.metrics["contributing_acres_is_lower_bound"]
+                ),
+                "routing_resolution_m": hydrology.metrics["routing_resolution_m"],
+                "stage_timings": hydrology.stage_timings,
+            },
+        )
+    if context_hydrology is not None:
+        for line in context.drainage_lines:
+            add_geometry_layer(
+                "hydrology_context_drainage_lines",
+                line,
+                {
+                    "analysis_scope": "coarse expanded context window",
+                    "routing_resolution_m": context.metrics["routing_resolution_m"],
+                    "threshold_cells": context.metrics["stream_threshold_cells"],
+                    "threshold_area_m2": context.metrics["stream_threshold_area_m2"],
+                },
+            )
+    session.add_all(pending_layers)
+    session.flush()
+    for layer in pending_layers:
+        for source in source_rows:
+            _source_ref(session, job.organization_id, source, "analysis_layers", layer.id)
+    return list(hydrology.warnings)
+
+
+def _persist_reference_layers(
+    session: Session,
+    job: Job,
+    analysis: SiteAnalysis,
+    bbox: tuple[float, float, float, float],
+    centroid: tuple[float, float],
+) -> tuple[list[dict[str, object]], list[Any] | None]:
+    warnings: list[dict[str, object]] = []
+    mapped_geometries: list[Any] | None = None
+    try:
+        features = fetch_3dhp(bbox)
+        hydro_source = _reference_source_row(
+            session,
+            name="USGS 3DHP",
+            agency="USGS",
+            dataset_name="3D Hydrography Program",
+            source_url=HYDROGRAPHY_URL,
+            access_method="arcgis-feature-service",
+            notes="JSON-queryable reference hydrography; Catchment may be unavailable locally.",
+        )
+        categories = {
+            20: "hydro_3dhp_hydrolocations",
+            30: "hydro_3dhp_hydrolocations",
+            40: "hydro_3dhp_hydrolocations",
+            50: "hydro_3dhp_flowlines",
+            60: "hydro_3dhp_waterbodies",
+            80: "hydro_3dhp_catchments",
+        }
+        pending_layers: list[AnalysisLayer] = []
+        for layer_id, layer_features in features.items():
+            if layer_id in (50, 60):
+                mapped_geometries = (mapped_geometries or []) + feature_geometries(layer_features)
+            for feature in layer_features:
+                geometries = feature_geometries([feature])
+                if not geometries:
+                    continue
+                layer = AnalysisLayer(
+                    organization_id=job.organization_id,
+                    analysis_id=analysis.id,
+                    category=categories[layer_id],
+                    geometry=from_shape(geometries[0], srid=4326),
+                    layer_metadata={
+                        "source_layer": layer_id,
+                        "attributes": feature.get("attributes", {}),
+                        "reference_only": True,
+                    },
+                )
+                pending_layers.append(layer)
+        session.add_all(pending_layers)
+        session.flush()
+        for layer in pending_layers:
+            _source_ref(session, job.organization_id, hydro_source, "analysis_layers", layer.id)
+        if not features.get(80):
+            warnings.append(
+                {
+                    "code": "hydro_3dhp_catchment_unavailable",
+                    "message": "3DHP Catchment reference data was unavailable for this analysis area.",
+                }
+            )
+    except HydrologySourceError as exc:
+        warnings.append({"code": "hydro_3dhp_unavailable", "message": str(exc)})
+    try:
+        membership = fetch_wbd_membership(*centroid)
+        wbd_source = _reference_source_row(
+            session,
+            name="USGS WBD",
+            agency="USGS",
+            dataset_name="Watershed Boundary Dataset",
+            source_url=WBD_URL,
+            access_method="arcgis-map-service",
+            notes="HUC10/HUC12 point membership; regional context only.",
+        )
+        layer = AnalysisLayer(
+            organization_id=job.organization_id,
+            analysis_id=analysis.id,
+            category="hydro_wbd_context",
+            layer_metadata={"reference_only": True, "membership": membership},
+        )
+        session.add(layer)
+        session.flush()
+        _source_ref(session, job.organization_id, wbd_source, "analysis_layers", layer.id)
+    except HydrologySourceError as exc:
+        warnings.append({"code": "hydro_wbd_unavailable", "message": str(exc)})
+    return warnings, mapped_geometries
+
+
+def _set_job(session: Session, job: Job, stage: JobStage, statuses: dict[str, Any], detail: str | None = None) -> None:
+    job.stage = stage
+    job.category_status = statuses
+    job.error_detail = detail
+    if stage in (JobStage.fetching, JobStage.processing, JobStage.derivatives):
+        job.started_at = job.started_at or datetime.now(UTC)
+    if stage in (JobStage.complete, JobStage.partial, JobStage.failed):
+        job.finished_at = datetime.now(UTC)
+    session.flush()
+
+
+def _terrain_analysis(session: Session, job: Job) -> None:
+    stage_timings: dict[str, float] = {}
+    parcel = session.scalar(
+        select(Parcel)
+        .join(Property, Property.id == Parcel.property_id)
+        .where(Property.project_id == job.project_id, Parcel.organization_id == job.organization_id)
+        .order_by(Parcel.created_at.desc())
+    )
+    if parcel is None:
+        raise ValueError("A confirmed parcel is required before terrain analysis.")
+    source_geometry = to_shape(cast(WKBElement, parcel.geometry))
+    projector = Transformer.from_crs("EPSG:4326", "EPSG:26914", always_xy=True)
+    inverse = Transformer.from_crs("EPSG:26914", "EPSG:4326", always_xy=True)
+    parcel_projected = transform(projector.transform, source_geometry)
+    buffered_projected = parcel_projected.buffer(DEFAULT_TERRAIN_BUFFER_METERS)
+    buffered_wgs84 = transform(inverse.transform, buffered_projected)
+    buffered_bounds = (
+        float(buffered_wgs84.bounds[0]),
+        float(buffered_wgs84.bounds[1]),
+        float(buffered_wgs84.bounds[2]),
+        float(buffered_wgs84.bounds[3]),
+    )
+    started = time.perf_counter()
+    selection = _select_products_with_cache(session, buffered_bounds)
+    stage_timings["source_selection"] = time.perf_counter() - started
+    sources = [_source_row(session, product) for product in selection.products]
+    if not selection.products:
+        analysis = SiteAnalysis(
+            organization_id=job.organization_id,
+            project_id=job.project_id,
+            parcel_id=parcel.id,
+        )
+        session.add(analysis)
+        session.flush()
+        session.add(
+            AnalysisCategory(
+                organization_id=job.organization_id,
+                analysis_id=analysis.id,
+                category="terrain",
+                status=CategoryStatus.unavailable,
+                confidence=Confidence.low,
+                confidence_reason=selection.warning or "No 3DEP product covered the buffered parcel.",
+            )
+        )
+        session.add(
+            DerivedMetric(
+                organization_id=job.organization_id,
+                analysis_id=analysis.id,
+                category="terrain",
+                name="coverage_fraction",
+                value=0.0,
+                unit="fraction",
+            )
+        )
+        _set_job(session, job, JobStage.partial, {"terrain": "unavailable"}, selection.warning)
+        return
+    started = time.perf_counter()
+    elevation, grid_transform, grid_crs, contributors = read_mosaic(
+        selection.products,
+        buffered_bounds,
+        "EPSG:26914",
+    )
+    stage_timings["mosaic_read"] = time.perf_counter() - started
+    contributor_sources = [source for source in sources if source.source_url in contributors]
+    _set_job(session, job, JobStage.processing, {"terrain": "processing"})
+    started = time.perf_counter()
+    result = analyze_elevation(
+        elevation,
+        grid_transform,
+        grid_crs,
+        parcel_projected,
+        buffered_projected,
+        parcel.computed_acres,
+    )
+    stage_timings["terrain_derivatives"] = time.perf_counter() - started
+    _set_job(session, job, JobStage.derivatives, {"terrain": "complete"})
+    analysis = SiteAnalysis(
+        organization_id=job.organization_id,
+        project_id=job.project_id,
+        parcel_id=parcel.id,
+    )
+    session.add(analysis)
+    session.flush()
+    category = AnalysisCategory(
+        organization_id=job.organization_id,
+        analysis_id=analysis.id,
+        category="terrain",
+        status=CategoryStatus.complete,
+        confidence=Confidence.high if result.coverage_fraction >= 0.99 else Confidence.medium,
+        confidence_reason=(
+            "1 m 3DEP coverage and 3x3 focal-mean-smoothed planning-grade slope statistics."
+            if not selection.used_fallback
+            else (
+                selection.warning
+                or "Cached or fallback 3DEP coverage and planning-grade slope statistics."
+            )
+        ),
+    )
+    session.add(category)
+    session.flush()
+    object_prefix = f"{job.organization_id}/{job.project_id}/analysis/{analysis.id}"
+    for category_name, array in {
+        "terrain_dem": result.elevation,
+        "terrain_slope": result.slope_percent,
+        "terrain_hillshade": result.hillshade,
+    }.items():
+        output_nodata = -3.4028230607370965e38
+        output = np.where(valid_data_mask(array, output_nodata), array, output_nodata)
+        key = f"{object_prefix}/{category_name}.tif"
+        _upload(key, _write_cog(output, result.transform, result.crs, output_nodata))
+        layer = AnalysisLayer(
+            organization_id=job.organization_id,
+            analysis_id=analysis.id,
+            category=category_name,
+            object_store_key=key,
+            layer_metadata={
+                "bounds": list(buffered_projected.bounds),
+                "crs": result.crs,
+                "resolution_m": abs(result.transform.a),
+                "nodata": -3.4028230607370965e38,
+                "source_urls": contributors,
+                "catalog_warning": selection.warning,
+                "stage_timings": stage_timings,
+            },
+        )
+        session.add(layer)
+        session.flush()
+        for source in contributor_sources:
+            session.add(
+                AnalysisSourceRef(
+                    organization_id=job.organization_id,
+                    data_source_id=source.id,
+                    derived_table="analysis_layers",
+                    derived_id=layer.id,
+                )
+            )
+    for elevation_m, is_index, geometry in result.contours:
+        contour_layer = AnalysisLayer(
+            organization_id=job.organization_id,
+            analysis_id=analysis.id,
+            category="terrain_contours",
+            geometry=from_shape(transform(inverse.transform, geometry), srid=4326),
+            layer_metadata={
+                "interval_feet": 2 if abs(result.transform.a) <= 1 else 5,
+                "index_interval_feet": 10,
+                "elevation_ft": elevation_m * 3.280839895,
+                "is_index": is_index,
+                "source_urls": contributors,
+            },
+        )
+        session.add(contour_layer)
+        session.flush()
+        for source in contributor_sources:
+            session.add(
+                AnalysisSourceRef(
+                    organization_id=job.organization_id,
+                    data_source_id=source.id,
+                    derived_table="analysis_layers",
+                    derived_id=contour_layer.id,
+                )
+            )
+    units = {
+        "coverage_fraction": "fraction",
+        "parcel_acres": "acres",
+        "valid_acres": "acres",
+        "elevation_min_m": "metres",
+        "elevation_max_m": "metres",
+        "elevation_mean_m": "metres",
+        "elevation_min_ft": "feet",
+        "elevation_max_ft": "feet",
+        "elevation_mean_ft": "feet",
+        "relief_m": "metres",
+        "relief_ft": "feet",
+        "mean_slope_percent": "percent",
+        "mean_slope_degrees": "degrees",
+    }
+    metrics = dict(result.metrics)
+    metrics["coverage_fraction"] = result.coverage_fraction
+    for name, value in metrics.items():
+        if name == "slope_histogram" or name == "elevation_units" or name == "slope_statistics_surface":
+            continue
+        if value is not None:
+            session.add(
+                DerivedMetric(
+                    organization_id=job.organization_id,
+                    analysis_id=analysis.id,
+                    category="terrain",
+                    name=name,
+                    value=float(value),
+                    unit=units.get(name, "number"),
+                )
+            )
+    for bucket in result.metrics.get("slope_histogram", []):
+        bucket_name = str(bucket["bucket"])
+        for suffix in ("acres", "percentage"):
+            session.add(
+                DerivedMetric(
+                    organization_id=job.organization_id,
+                    analysis_id=analysis.id,
+                    category="terrain",
+                    name=f"slope_bucket:{bucket_name}:{suffix}",
+                    value=float(bucket[suffix]),
+                    unit="acres" if suffix == "acres" else "percent_of_valid_slope_pixels",
+                )
+            )
+    if result.warning:
+        session.add(
+            DerivedMetric(
+                organization_id=job.organization_id,
+                analysis_id=analysis.id,
+                category="terrain",
+                name="coverage_missing_fraction",
+                value=float(result.warning["missing_fraction"]),
+                unit="fraction",
+                )
+            )
+    hydrology_warnings: list[dict[str, object]] = []
+    hydrology_buffer_meters = DEFAULT_TERRAIN_BUFFER_METERS
+    hydrology_stage_timings: dict[str, float] = {}
+    try:
+        hydrology_started = time.perf_counter()
+        hydrology_result = run_hydrology(
+            elevation,
+            grid_transform,
+            grid_crs,
+            parcel_projected,
+            parcel.computed_acres,
+        )
+        local_hydrology_result = hydrology_result
+        context_hydrology_result = hydrology_result
+        context_contributors: tuple[str, ...] = contributors
+        context_buffered_projected = buffered_projected
+        context_buffer_meters = hydrology_buffer_meters
+        if hydrology_result.metrics.get("window_truncated") is True:
+            hydrology_buffer_meters = 2000.0
+            expanded_projected = parcel_projected.buffer(hydrology_buffer_meters)
+            expanded_wgs84 = transform(inverse.transform, expanded_projected)
+            expanded_bounds: tuple[float, float, float, float] = (
+                float(expanded_wgs84.bounds[0]),
+                float(expanded_wgs84.bounds[1]),
+                float(expanded_wgs84.bounds[2]),
+                float(expanded_wgs84.bounds[3]),
+            )
+            expansion_source_started = time.perf_counter()
+            expanded_selection = (
+                _cached_selection(session, expanded_bounds)
+                if selection.used_fallback
+                else _select_products_with_cache(session, expanded_bounds)
+            )
+            hydrology_stage_timings["expansion_source_selection"] = (
+                time.perf_counter() - expansion_source_started
+            )
+            if expanded_selection.products:
+                expansion_mosaic_started = time.perf_counter()
+                expanded_elevation, expanded_transform, expanded_crs, expanded_contributors = read_mosaic(
+                    expanded_selection.products,
+                    expanded_bounds,
+                    "EPSG:26914",
+                    resolution=10.0,
+                )
+                hydrology_stage_timings["expansion_mosaic_read"] = (
+                    time.perf_counter() - expansion_mosaic_started
+                )
+                expansion_hydrology_started = time.perf_counter()
+                context_hydrology_result = run_hydrology(
+                    expanded_elevation,
+                    expanded_transform,
+                    expanded_crs,
+                    parcel_projected,
+                    parcel.computed_acres,
+                )
+                hydrology_stage_timings["expansion_hydrology"] = (
+                    time.perf_counter() - expansion_hydrology_started
+                )
+                buffered_projected = expanded_projected
+                buffered_bounds = expanded_bounds
+                contributors = expanded_contributors
+                context_hydrology_result.metrics["expansion_routing_resolution_m"] = 10.0
+                context_contributors = expanded_contributors
+                context_buffered_projected = expanded_projected
+                context_buffer_meters = hydrology_buffer_meters
+                for product in expanded_selection.products:
+                    if product.source_url not in [source.source_url for source in sources]:
+                        sources.append(_source_row(session, product))
+        reference_started = time.perf_counter()
+        reference_warnings, mapped_geometries = _persist_reference_layers(
+            session,
+            job,
+            analysis,
+            buffered_bounds,
+            (float(source_geometry.centroid.x), float(source_geometry.centroid.y)),
+        )
+        hydrology_stage_timings["reference_queries"] = time.perf_counter() - reference_started
+        hydrology_warnings.extend(reference_warnings)
+        projected_mapped_geometries = (
+            None
+            if mapped_geometries is None
+            else [transform(projector.transform, geometry) for geometry in mapped_geometries]
+        )
+        assign_mapped_water_relationships(local_hydrology_result, projected_mapped_geometries)
+        persistence_started = time.perf_counter()
+        hydrology_warnings.extend(
+            _persist_hydrology(
+                session,
+                job,
+                analysis,
+                parcel,
+                parcel_projected,
+                inverse,
+                local_hydrology_result,
+                contributors,
+                buffered_projected,
+                hydrology_buffer_meters,
+                context_hydrology=context_hydrology_result,
+                context_contributors=context_contributors,
+                context_buffer_geometry=context_buffered_projected,
+                context_buffer_meters=context_buffer_meters,
+            )
+        )
+        hydrology_stage_timings.update(local_hydrology_result.stage_timings)
+        hydrology_stage_timings["persistence"] = time.perf_counter() - persistence_started
+        hydrology_stage_timings["hydrology_total_worker"] = time.perf_counter() - hydrology_started
+    except HydrologySourceError as exc:
+        hydrology_warnings.append({"code": "hydrology_unavailable", "message": str(exc)})
+        session.add(
+            AnalysisCategory(
+                organization_id=job.organization_id,
+                analysis_id=analysis.id,
+                category="hydrology",
+                status=CategoryStatus.unavailable,
+                confidence=Confidence.low,
+                confidence_reason=str(exc),
+            )
+        )
+    all_warnings = ([result.warning] if result.warning else []) + hydrology_warnings
+    _set_job(
+        session,
+        job,
+        JobStage.partial if all_warnings else JobStage.complete,
+        {
+            "terrain": "complete",
+            "hydrology": "partial" if hydrology_warnings else "complete",
+            "stage_timings": {**stage_timings, **hydrology_stage_timings},
+        },
+        "; ".join(
+            str(warning.get("message"))
+            for warning in all_warnings
+            if warning and warning.get("message")
+        )
+        or selection.warning,
+    )
+
+
+@celery_app.task(name="sitesense.terrain_analysis")  # type: ignore[untyped-decorator]
+def terrain_analysis(job_id: str) -> str:
+    with Session(engine) as session:
+        job = session.get(Job, UUID(job_id))
+        if job is None:
+            raise ValueError(f"Analysis job {job_id} not found")
+        try:
+            _set_job(session, job, JobStage.fetching, {"terrain": "fetching"})
+            _terrain_analysis(session, job)
+            session.commit()
+        except TerrainSourceError as exc:
+            session.rollback()
+            with Session(engine) as failed_session:
+                failed_job = failed_session.get(Job, UUID(job_id))
+                if failed_job is not None:
+                    _set_job(
+                        failed_session,
+                        failed_job,
+                        JobStage.partial,
+                        {"terrain": "unavailable"},
+                        f"Terrain source unavailable: {exc}",
+                    )
+                    failed_session.commit()
+        except Exception:
+            session.rollback()
+            with Session(engine) as failed_session:
+                failed_job = failed_session.get(Job, UUID(job_id))
+                if failed_job is not None:
+                    _set_job(
+                        failed_session,
+                        failed_job,
+                        JobStage.failed,
+                        {"terrain": "failed"},
+                        "Terrain analysis failed.",
+                    )
+                    failed_session.commit()
+            raise
+        return job_id
+
+
+enqueue_analysis = terrain_analysis
+
+
 def noop_analysis(job_id: str, outcome: str = "complete", error_detail: str | None = None) -> str:
-    """Foundation task; later handoffs replace this with staged analysis."""
+    """Retain the foundation task contract for lifecycle compatibility tests."""
     with engine.begin() as connection:
         if outcome == "failed":
             transition_job(connection, job_id, JobStage.failed, {"foundation": "failed"}, error_detail or "Analysis failed.")
@@ -32,6 +1000,3 @@ def noop_analysis(job_id: str, outcome: str = "complete", error_detail: str | No
         else:
             transition_job(connection, job_id, JobStage.complete, {"foundation": "complete"}, error_detail)
     return job_id
-
-
-enqueue_analysis = noop_analysis

@@ -1,3 +1,4 @@
+from typing import Any
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -19,7 +20,7 @@ class JobRead(BaseModel):
     id: UUID
     project_id: UUID
     stage: str
-    category_status: dict[str, str]
+    category_status: dict[str, Any]
     error_detail: str | None = None
 
 
@@ -34,6 +35,17 @@ class AnalysisRead(BaseModel):
     status: str
     confidence: str
     confidence_reason: str
+    terrain: dict[str, object] | None = None
+    hydrology: dict[str, object] | None = None
+    warnings: list[dict[str, object]] = Field(default_factory=list)
+
+
+class AnalysisLayerRead(BaseModel):
+    id: UUID
+    category: str
+    object_store_key: str | None = None
+    geometry: dict[str, object] | None = None
+    metadata: dict[str, object] = Field(default_factory=dict)
 
 
 class ParcelCandidate(BaseModel):
