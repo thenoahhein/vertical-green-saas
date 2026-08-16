@@ -69,11 +69,21 @@ rooftop or survey point. Attribute matching is therefore important when the
 interpolated point falls outside the authoritative CAD parcel. Census
 geographies resolve the county when possible; unsupported or unavailable
 geographies fall back to querying all supported county adapters. Address
-resolution can be measured against the fixed benchmark with:
+resolution can be measured against the fixed benchmark with. If Census returns
+no match, the same situs-only query runs across all counties; only an empty
+result produces the typed address-not-found response. Without a point,
+distance is null and candidates are centered from the top-ranked parcel.
+Situs matches are only boosted within 5 km of a geocoded point to prevent a
+distant same-number false match from outranking a containing parcel.
 
 ```bash
 uv run python scripts/benchmark_address_resolution.py
 ```
+
+The development compose stack bind-mounts the API and worker source trees.
+Uvicorn reloads API edits, and `watchfiles` restarts the worker when Python
+files change; source edits therefore take effect without rebuilding images.
+The Dockerfiles remain self-contained for production-shaped image builds.
 
 To add a county, inspect and record its layer metadata, add a
 `CountySource`/`ParcelFieldMapping`, register its `DataSource` in `seed.py`,

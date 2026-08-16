@@ -21,12 +21,15 @@ services:
     command: -c "mc alias set local http://minio:9000 minio miniopassword && mc mb --ignore-existing local/sitesense"
   api:
     build: {context: .., dockerfile: apps/api/Dockerfile}
+    command: uv run uvicorn sitesense.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir /app/apps/api/src
+    volumes: ["../apps/api/src:/app/apps/api/src"]
     environment: {DATABASE_URL: postgresql+psycopg://sitesense:sitesense@postgis:5432/sitesense, REDIS_URL: redis://redis:6379/0}
     ports: ["8000:8000"]
     depends_on: {postgis: {condition: service_healthy}, redis: {condition: service_healthy}, minio-init: {condition: service_completed_successfully}}
   worker:
     build: {context: .., dockerfile: apps/worker/Dockerfile}
-    command: uv run celery -A sitesense_worker.tasks.celery_app worker --loglevel=INFO
+    command: uv run watchfiles --filter python "uv run celery -A sitesense_worker.tasks.celery_app worker --loglevel=INFO" /app/apps/worker/src
+    volumes: ["../apps/worker/src:/app/apps/worker/src"]
     environment: {DATABASE_URL: postgresql+psycopg://sitesense:sitesense@postgis:5432/sitesense, REDIS_URL: redis://redis:6379/0}
     depends_on: {postgis: {condition: service_healthy}, redis: {condition: service_healthy}}
   web:
