@@ -146,6 +146,10 @@ def test_closed_depression_is_detected_and_filled() -> None:
         stream_threshold_cells=2,
     )
     assert result.depressions
+    assert all(
+        np.isfinite(depression.depth_m) and np.isfinite(depression.volume_m3)
+        for depression in result.depressions
+    )
     assert float(result.conditioned[24, 24]) > float(elevation[24, 24])
 
 

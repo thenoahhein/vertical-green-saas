@@ -105,6 +105,14 @@ async def analysis(project_id: UUID, db: AsyncSession = Depends(get_db), org: Cu
         terrain_payload["slope_histogram"] = list(histogram.values())
     coverage = terrain_payload.get("coverage_fraction")
     warnings: list[dict[str, object]] = []
+    if category is not None and "terrain_catalog_unavailable_cached_product" in category.confidence_reason:
+        warnings.append(
+            {
+                "code": "terrain_catalog_unavailable_cached_product",
+                "message": category.confidence_reason,
+                "analysis_status": "complete_with_cached_source",
+            }
+        )
     if isinstance(coverage, (int, float)) and coverage == 0:
         warnings.append(
             {

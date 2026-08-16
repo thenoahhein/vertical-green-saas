@@ -159,7 +159,7 @@ def _query_products_with_retry(
     dataset_name: str,
     client: ProductClient,
     *,
-    attempts: int = 3,
+    attempts: int = 2,
 ) -> list[TerrainProduct]:
     last_error: httpx.HTTPError | None = None
     for attempt in range(attempts):
@@ -168,7 +168,7 @@ def _query_products_with_retry(
         except httpx.HTTPError as exc:
             last_error = exc
             if attempt + 1 < attempts:
-                time.sleep(2**attempt)
+                time.sleep(1)
     assert last_error is not None
     raise last_error
 
@@ -178,7 +178,7 @@ def select_products(
     client: ProductClient | None = None,
 ) -> TerrainSelection:
     """Prefer 1 m products and use 1/3 arc-second only for incomplete coverage."""
-    http_client: ProductClient = cast(ProductClient, client or httpx.Client(timeout=30.0))
+    http_client: ProductClient = cast(ProductClient, client or httpx.Client(timeout=8.0))
     close_client = client is None
     try:
         try:

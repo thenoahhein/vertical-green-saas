@@ -236,7 +236,20 @@ def _depression_features(
             transform=transform,
             invert=True,
         )
-        depth = np.maximum(conditioned - elevation, 0.0)
+        valid_cells = (
+            np.isfinite(conditioned)
+            & np.isfinite(elevation)
+            & (conditioned > -1e30)
+            & (elevation > -1e30)
+        )
+        depth = np.zeros(conditioned.shape, dtype="float64")
+        np.subtract(
+            conditioned.astype("float64"),
+            elevation.astype("float64"),
+            out=depth,
+            where=valid_cells,
+        )
+        np.maximum(depth, 0.0, out=depth)
         depths = depth[mask & np.isfinite(depth)]
         if not depths.size or float(np.max(depths)) < MIN_DEPRESSION_DEPTH_M:
             continue
@@ -417,7 +430,20 @@ def run_hydrology(
         for polygon in _vectorize_mask(subbasins, transform, lambda values: values > 0)
         if polygon.area >= MIN_CATCHMENT_AREA_M2
     ]
-    depression_depth = np.maximum(conditioned - elevation, 0.0)
+    valid_depth_cells = (
+        np.isfinite(conditioned)
+        & np.isfinite(elevation)
+        & (conditioned > -1e30)
+        & (elevation > -1e30)
+    )
+    depression_depth = np.zeros(conditioned.shape, dtype="float64")
+    np.subtract(
+        conditioned.astype("float64"),
+        elevation.astype("float64"),
+        out=depression_depth,
+        where=valid_depth_cells,
+    )
+    np.maximum(depression_depth, 0.0, out=depression_depth)
     raw_depressions = _vectorize_mask(
         depression_depth, transform, lambda values: values >= MIN_DEPRESSION_DEPTH_M
     )
