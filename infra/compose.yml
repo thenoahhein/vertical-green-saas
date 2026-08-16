@@ -23,14 +23,14 @@ services:
     build: {context: .., dockerfile: apps/api/Dockerfile}
     command: uv run uvicorn sitesense.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir /app/apps/api/src
     volumes: ["../apps/api/src:/app/apps/api/src"]
-    environment: {DATABASE_URL: postgresql+psycopg://sitesense:sitesense@postgis:5432/sitesense, REDIS_URL: redis://redis:6379/0, CORS_ALLOWED_ORIGINS: "http://localhost:3000,http://127.0.0.1:3000"}
+    environment: {DATABASE_URL: postgresql+psycopg://sitesense:sitesense@postgis:5432/sitesense, REDIS_URL: redis://redis:6379/0, OBJECT_STORE_ENDPOINT: http://minio:9000, OBJECT_STORE_ACCESS_KEY: minio, OBJECT_STORE_SECRET_KEY: miniopassword, CORS_ALLOWED_ORIGINS: "http://localhost:3000,http://127.0.0.1:3000"}
     ports: ["8000:8000"]
     depends_on: {postgis: {condition: service_healthy}, redis: {condition: service_healthy}, minio-init: {condition: service_completed_successfully}}
   worker:
     build: {context: .., dockerfile: apps/worker/Dockerfile}
     command: uv run watchfiles --filter python "uv run celery -A sitesense_worker.tasks.celery_app worker --loglevel=INFO" /app/apps/worker/src
     volumes: ["../apps/worker/src:/app/apps/worker/src"]
-    environment: {DATABASE_URL: postgresql+psycopg://sitesense:sitesense@postgis:5432/sitesense, REDIS_URL: redis://redis:6379/0}
+    environment: {DATABASE_URL: postgresql+psycopg://sitesense:sitesense@postgis:5432/sitesense, REDIS_URL: redis://redis:6379/0, OBJECT_STORE_ENDPOINT: http://minio:9000, OBJECT_STORE_ACCESS_KEY: minio, OBJECT_STORE_SECRET_KEY: miniopassword}
     depends_on: {postgis: {condition: service_healthy}, redis: {condition: service_healthy}}
   web:
     build: {context: .., dockerfile: apps/web/Dockerfile}
