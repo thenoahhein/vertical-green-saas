@@ -83,11 +83,6 @@ def proposal_pdf(proposal_id: UUID) -> JSONResponse:
     return planned()
 
 
-@project_router.get("/layers", response_model=NotImplementedResponse, status_code=501)
-def layers() -> JSONResponse:
-    return planned()
-
-
 @project_router.get("/metrics", response_model=NotImplementedResponse, status_code=501)
 def metrics() -> JSONResponse:
     return planned()

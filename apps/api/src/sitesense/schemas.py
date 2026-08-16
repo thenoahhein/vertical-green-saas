@@ -34,6 +34,16 @@ class AnalysisRead(BaseModel):
     status: str
     confidence: str
     confidence_reason: str
+    terrain: dict[str, object] | None = None
+    warnings: list[dict[str, object]] = Field(default_factory=list)
+
+
+class AnalysisLayerRead(BaseModel):
+    id: UUID
+    category: str
+    object_store_key: str | None = None
+    geometry: dict[str, object] | None = None
+    metadata: dict[str, object] = Field(default_factory=dict)
 
 
 class ParcelCandidate(BaseModel):
