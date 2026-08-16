@@ -1,17 +1,20 @@
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
 import pytest
 from rasterio.transform import from_origin
 from rasterio.warp import transform_bounds
-from shapely.geometry import box
+from shapely.geometry import MultiPolygon, box
 from sitesense.terrain import (
     NODATA,
     ONE_METER_DATASET,
     THIRD_ARC_SECOND_DATASET,
+    TerrainProduct,
     TerrainSelection,
     analyze_elevation,
+    generate_contours,
     read_mosaic,
     select_products,
 )
@@ -166,11 +169,68 @@ def test_adjacent_fixture_tiles_mosaic_on_one_grid() -> None:
         ),
     )
     target_bounds = transform_bounds("EPSG:26914", "EPSG:4326", 500000, 0, 500032, 16)
-    mosaic, _, _ = read_mosaic(products, target_bounds, "EPSG:26914")
+    mosaic, _, _, contributors = read_mosaic(products, target_bounds, "EPSG:26914")
     assert mosaic.shape[0] >= 16
     assert mosaic.shape[1] >= 32
     assert np.all(mosaic[:16, :16] == 100)
     assert np.all(mosaic[:16, 16:] == 200)
+    assert contributors == (str(root / "seam_left.tif"), str(root / "seam_right.tif"))
+
+
+def test_overlapping_tiles_prefer_newest_publication_and_contributors() -> None:
+    root = Path(__file__).parent / "fixtures" / "terrain"
+    old = TerrainProduct(
+        "old",
+        ONE_METER_DATASET,
+        str(root / "overlap_old.tif"),
+        (500000, 0, 500016, 16),
+        "1 m",
+        datetime(2017, 1, 1, tzinfo=UTC),
+        None,
+    )
+    new = TerrainProduct(
+        "new",
+        ONE_METER_DATASET,
+        str(root / "overlap_new.tif"),
+        (500000, 0, 500016, 16),
+        "1 m",
+        datetime(2018, 1, 1, tzinfo=UTC),
+        None,
+    )
+    target_bounds = transform_bounds("EPSG:26914", "EPSG:4326", 500000, 0, 500016, 16)
+    mosaic, _, _, contributors = read_mosaic((old, new), target_bounds, "EPSG:26914")
+    assert np.all(mosaic[:16, :16] == 300)
+    assert contributors == (str(root / "overlap_new.tif"),)
+
+
+def test_aspect_matches_north_up_analytic_planes() -> None:
+    rows, columns = np.mgrid[:32, :32]
+    north_descending = (100 - (31 - rows) * 0.1).astype("float32")
+    east_ascending = (100 + columns * 0.1).astype("float32")
+    kwargs = {
+        "transform": from_origin(0, 32, 1, 1),
+        "crs": "EPSG:26914",
+        "parcel_geometry": box(4, 4, 28, 28),
+        "buffer_geometry": box(0, 0, 32, 32),
+        "parcel_acres": 24 * 24 / 4046.8564224,
+    }
+    north_result = analyze_elevation(north_descending, **kwargs)
+    east_result = analyze_elevation(east_ascending, **kwargs)
+    assert np.nanmedian(north_result.aspect_degrees[5:-5, 5:-5]) == pytest.approx(0, abs=0.5)
+    assert np.nanmedian(east_result.aspect_degrees[5:-5, 5:-5]) == pytest.approx(270, abs=0.5)
+
+
+def test_contours_include_levels_index_flags_and_flatten_clipped_parts() -> None:
+    rows, columns = np.mgrid[:32, :32]
+    elevation = (99 + rows * 0.5).astype("float32")
+    clip = MultiPolygon([box(8, 8, 24, 12), box(8, 20, 24, 24)])
+    contours = generate_contours(elevation, from_origin(0, 32, 1, 1), clip, 2)
+    assert contours
+    levels_feet = [level * 3.280839895 for level, _, _ in contours]
+    assert levels_feet == sorted(levels_feet)
+    assert all(level % 2 == pytest.approx(0, abs=0.01) for level in levels_feet)
+    assert any(is_index for _, is_index, _ in contours)
+    assert all(geometry.geom_type in {"LineString", "MultiLineString"} for _, _, geometry in contours)
 
 
 def test_bucket_acres_reconcile_to_parcel_area() -> None:
