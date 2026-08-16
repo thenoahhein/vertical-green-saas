@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -23,6 +24,9 @@ class ParcelFieldMapping:
     legal_description: tuple[str, ...]
     appraisal_acres: str
     owner: str
+    situs_number: str
+    situs_street: str
+    situs_suffix: str
 
 
 @dataclass(frozen=True)
@@ -47,6 +51,9 @@ COMMON_FIELDS = ParcelFieldMapping(
     legal_description=("legal_desc", "legal_desc2", "legal_desc3"),
     appraisal_acres="legal_acreage",
     owner="file_as_name",
+    situs_number="situs_num",
+    situs_street="situs_street",
+    situs_suffix="situs_street_sufix",
 )
 
 COUNTY_SOURCES = (
@@ -94,20 +101,26 @@ class NormalizedParcel:
     raw_attributes: dict[str, Any]
     distance_meters: float = 0.0
     contains_point: bool = False
+    situs_match: bool = False
 
     @property
     def computed_acres(self) -> float:
         return acreage(self.geometry)
 
 
-def _cache_key(point: Point, buffer_meters: float) -> str:
-    return f"{point.x:.6f}:{point.y:.6f}:{buffer_meters:.1f}"
+def _cache_key(point: Point, buffer_meters: float, address: str | None) -> str:
+    return f"{point.x:.6f}:{point.y:.6f}:{buffer_meters:.1f}:{normalize_situs(address or '')}"
 
 
 class ParcelSourceAdapter(Protocol):
     source: CountySource
 
-    async def search(self, point: Point, buffer_meters: float = 0) -> list[NormalizedParcel]:
+    async def search(
+        self,
+        point: Point,
+        buffer_meters: float = 1000,
+        address: str | None = None,
+    ) -> list[NormalizedParcel]:
         ...
 
 
@@ -134,22 +147,29 @@ class ArcGISParcelAdapter:
         source: CountySource,
         client: httpx.AsyncClient | None = None,
         timeout: float = 8.0,
+        max_record_count: int = 2000,
     ) -> None:
         self.source = source
         self.client = client
         self.timeout = timeout
+        self.max_record_count = max_record_count
 
-    async def search(self, point: Point, buffer_meters: float = 0) -> list[NormalizedParcel]:
+    async def search(
+        self,
+        point: Point,
+        buffer_meters: float = 1000,
+        address: str | None = None,
+    ) -> list[NormalizedParcel]:
         # ArcGIS accepts WGS84 point queries. A small envelope around the point
         # catches parcels straddling service/county boundaries without broad scans.
         query_geometry = point.buffer(buffer_meters / 111_320) if buffer_meters else point
         minx, miny, maxx, maxy = query_geometry.bounds
         geometry = f"{minx},{miny},{maxx},{maxy}" if buffer_meters else f"{point.x},{point.y}"
-        key = f"{self.source.county}:{_cache_key(point, buffer_meters)}"
+        key = f"{self.source.county}:{_cache_key(point, buffer_meters, address)}"
         cached = _SEARCH_CACHE.get(key)
         if cached and cached[0] > time.monotonic():
             return cached[1]
-        params = {
+        spatial_params = {
             "f": "json",
             "where": "1=1",
             "geometry": geometry,
@@ -159,20 +179,28 @@ class ArcGISParcelAdapter:
             "outFields": "*",
             "returnGeometry": "true",
             "outSR": "4326",
-            "resultRecordCount": 10,
         }
+        query = parse_situs_query(address) if address else None
         own_client = self.client is None
         client = self.client or httpx.AsyncClient(timeout=self.timeout)
         try:
             last_error: Exception | None = None
             for attempt in range(3):
                 try:
-                    response = await client.get(f"{self.source.url}/query", params=params)
-                    response.raise_for_status()
-                    payload = response.json()
-                    if payload.get("error"):
-                        raise RuntimeError(payload["error"].get("message", "ArcGIS query failed"))
-                    parcels = [self._normalize(feature, point) for feature in payload.get("features", [])]
+                    spatial = await self._query_pages(client, spatial_params, point)
+                    attribute = (
+                        await self._query_pages(
+                            client,
+                            self._attribute_params(query),
+                            point,
+                        )
+                        if query
+                        else []
+                    )
+                    parcels = self._merge(
+                        [self._normalize(feature, point) for feature in spatial],
+                        [self._normalize(feature, point, situs_match=True) for feature in attribute],
+                    )
                     _SEARCH_CACHE[key] = (time.monotonic() + 300, parcels)
                     return parcels
                 except (httpx.HTTPError, ValueError, RuntimeError) as exc:
@@ -185,7 +213,71 @@ class ArcGISParcelAdapter:
             if own_client:
                 await client.aclose()
 
-    def _normalize(self, feature: dict[str, Any], point: Point) -> NormalizedParcel:
+    async def _query_pages(
+        self,
+        client: httpx.AsyncClient,
+        params: dict[str, str],
+        point: Point,
+    ) -> list[dict[str, Any]]:
+        page_size = self.max_record_count
+        offset = 0
+        features: list[dict[str, Any]] = []
+        while True:
+            page_params = {**params, "resultOffset": str(offset), "resultRecordCount": str(page_size)}
+            response = await client.get(f"{self.source.url}/query", params=page_params)
+            response.raise_for_status()
+            payload = response.json()
+            if payload.get("error"):
+                raise RuntimeError(payload["error"].get("message", "ArcGIS query failed"))
+            page = payload.get("features", [])
+            features.extend(page)
+            if not payload.get("exceededTransferLimit"):
+                break
+            offset += len(page)
+            if not page:
+                break
+        return features
+
+    def _attribute_params(self, query: SitusQuery) -> dict[str, str]:
+        street_clauses = [
+            "("
+            f"{self.source.fields.situs_street} LIKE '%{_escape_sql(token)}%' "
+            f"OR {self.source.fields.situs_suffix} LIKE '%{_escape_sql(token)}%'"
+            ")"
+            for token in query.street_tokens
+        ]
+        where = (
+            f"{self.source.fields.situs_number} = '{_escape_sql(query.house_number)}' "
+            f"AND ({' AND '.join(street_clauses)})"
+        )
+        return {
+            "f": "json",
+            "where": where,
+            "outFields": "*",
+            "returnGeometry": "true",
+            "outSR": "4326",
+        }
+
+    def _merge(
+        self,
+        spatial: list[NormalizedParcel],
+        attribute: list[NormalizedParcel],
+    ) -> list[NormalizedParcel]:
+        merged = {parcel.source_feature_id: parcel for parcel in spatial}
+        for parcel in attribute:
+            current = merged.get(parcel.source_feature_id)
+            if current is None:
+                merged[parcel.source_feature_id] = parcel
+            else:
+                current.situs_match = True
+        return list(merged.values())
+
+    def _normalize(
+        self,
+        feature: dict[str, Any],
+        point: Point,
+        situs_match: bool = False,
+    ) -> NormalizedParcel:
         attributes = feature.get("attributes") or {}
         geometry = _arcgis_geometry(feature.get("geometry") or {})
         mapping = self.source.fields
@@ -208,29 +300,40 @@ class ArcGISParcelAdapter:
             owner=_text(attributes, (mapping.owner,)),
             geometry=geometry,
             raw_attributes=attributes,
-            distance_meters=project_for_length(point).distance(project_for_length(geometry).centroid),
+            distance_meters=project_for_length(point).distance(project_for_length(geometry)),
             contains_point=geometry.covers(point),
+            situs_match=situs_match,
         )
 
 
 async def search_counties(
     point: Point,
     county: str | None = None,
-    buffer_meters: float = 250,
+    buffer_meters: float = 1000,
+    address: str | None = None,
     adapters: tuple[ParcelSourceAdapter, ...] | None = None,
     health: dict[str, str] | None = None,
 ) -> list[NormalizedParcel]:
+    supported_county = next(
+        (
+            source.county
+            for source in COUNTY_SOURCES
+            if county is not None and source.county.casefold() == county.casefold()
+        ),
+        None,
+    )
     selected = tuple(
         source for source in COUNTY_SOURCES
-        if county is None or source.county.casefold() == county.casefold()
+        if supported_county is None or source.county == supported_county
     )
     active = adapters or tuple(ArcGISParcelAdapter(source) for source in selected)
     if not active:
         return []
-    results = await asyncio.gather(
-        *(adapter.search(point, buffer_meters) for adapter in active),
-        return_exceptions=True,
+    searches = (
+        (adapter.search(point, buffer_meters, address) if address else adapter.search(point, buffer_meters))
+        for adapter in active
     )
+    results = await asyncio.gather(*searches, return_exceptions=True)
     parcels: list[NormalizedParcel] = []
     for adapter, result in zip(active, results, strict=True):
         if isinstance(result, list):
@@ -239,8 +342,64 @@ async def search_counties(
                 health[adapter.source.county] = "healthy"
         elif health is not None:
             health[adapter.source.county] = f"unavailable:{type(result).__name__}"
-    return sorted(parcels, key=lambda parcel: (not parcel.contains_point, parcel.distance_meters))
+    unique: dict[tuple[str, str], NormalizedParcel] = {}
+    for parcel in parcels:
+        key = (parcel.source_url, parcel.source_feature_id)
+        existing = unique.get(key)
+        if existing is None or (
+            parcel.situs_match and not existing.situs_match
+        ):
+            unique[key] = parcel
+    return sorted(
+        unique.values(),
+        key=lambda parcel: (not parcel.situs_match, not parcel.contains_point, parcel.distance_meters),
+    )[:10]
 
 
 def source_for_url(url: str) -> CountySource | None:
     return next((source for source in COUNTY_SOURCES if source.data_source_url == url), None)
+
+
+_ABBREVIATIONS = {
+    "ST": "STREET",
+    "RD": "ROAD",
+    "LN": "LANE",
+    "DR": "DRIVE",
+    "HWY": "HIGHWAY",
+    "CR": "COUNTY ROAD",
+    "ESMT": "EASEMENT",
+}
+_DIRECTION_WORDS = {"N", "S", "E", "W", "NE", "NW", "SE", "SW"}
+_STREET_SUFFIXES = {"STREET", "ROAD", "LANE", "DRIVE", "HIGHWAY", "EASEMENT", "COUNTY"}
+
+
+def normalize_situs(value: str) -> str:
+    value = re.sub(r"[^A-Za-z0-9]+", " ", value.upper())
+    tokens: list[str] = []
+    for token in value.split():
+        tokens.extend(_ABBREVIATIONS.get(token, token).split())
+    return " ".join(tokens)
+
+
+@dataclass(frozen=True)
+class SitusQuery:
+    house_number: str
+    street_tokens: tuple[str, ...]
+
+
+def parse_situs_query(address: str) -> SitusQuery | None:
+    first_segment = address.split(",", 1)[0]
+    match = re.match(r"\s*(\d+)\s+(.+)", first_segment)
+    if not match:
+        return None
+    normalized = normalize_situs(match.group(2))
+    tokens = tuple(
+        token
+        for token in normalized.split()
+        if token not in _DIRECTION_WORDS and token not in _STREET_SUFFIXES
+    )
+    return SitusQuery(match.group(1), tokens or tuple(normalized.split()))
+
+
+def _escape_sql(value: str) -> str:
+    return value.replace("'", "''")

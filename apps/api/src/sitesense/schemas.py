@@ -67,7 +67,7 @@ class ParcelSearchRequest(BaseModel):
     address: str | None = None
     latitude: float | None = Field(default=None, ge=-90, le=90)
     longitude: float | None = Field(default=None, ge=-180, le=180)
-    buffer_meters: float = Field(default=250, ge=0, le=5000)
+    buffer_meters: float = Field(default=1000, ge=0, le=5000)
 
     def has_coordinates(self) -> bool:
         return self.latitude is not None and self.longitude is not None

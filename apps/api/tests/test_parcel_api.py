@@ -3,6 +3,7 @@ from uuid import UUID
 from fastapi.testclient import TestClient
 from shapely.geometry import MultiPolygon, Polygon
 from sitesense.disclaimers import DISCLAIMERS
+from sitesense.geocoding import GeocoderNoMatch
 from sitesense.main import app
 from sitesense.models import DataSource
 from sitesense.parcel_sources import NormalizedParcel
@@ -104,3 +105,13 @@ def test_coordinate_fallback_does_not_require_geocoder(monkeypatch) -> None:
     )
     assert response.status_code == 200
     assert response.json()["latitude"] == 30
+
+
+def test_geocoder_no_match_is_typed_not_validation_error(monkeypatch) -> None:
+    async def unavailable(_address: str):
+        raise GeocoderNoMatch("no match")
+
+    monkeypatch.setattr(parcels, "geocode", unavailable)
+    response = TestClient(app).get("/api/parcel-search?address=not-a-real-address", headers=_headers())
+    assert response.status_code == 404
+    assert response.json()["detail"]["code"] == "address_not_found"

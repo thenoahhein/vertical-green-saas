@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from sitesense.disclaimers import DISCLAIMERS
 from sitesense.geo import acreage
-from sitesense.geocoding import geocode
+from sitesense.geocoding import GeocoderNoMatch, geocode, resolve_county
 from sitesense.models import AnalysisSourceRef, DataSource, Parcel, Project, Property
 from sitesense.parcel_sources import NormalizedParcel, search_counties
 from sitesense.schemas import (
@@ -71,7 +71,7 @@ async def parcel_search(
     address: str | None = Query(default=None),
     latitude: float | None = Query(default=None, ge=-90, le=90),
     longitude: float | None = Query(default=None, ge=-180, le=180),
-    buffer_meters: float = Query(default=250, ge=0, le=5000),
+    buffer_meters: float = Query(default=1000, ge=0, le=5000),
 ) -> ParcelSearchResponse:
     matched_address: str | None = None
     county: str | None = None
@@ -82,21 +82,36 @@ async def parcel_search(
         try:
             result = await geocode(address)
             latitude, longitude = result.latitude, result.longitude
-            matched_address, county = result.matched_address, result.county
+            matched_address = result.matched_address
+            county = await resolve_county(address)
+        except GeocoderNoMatch as exc:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "address_not_found",
+                    "message": "Address was not found; place a point on the map or provide latitude and longitude.",
+                },
+            ) from exc
         except Exception as exc:
             geocoder_failed = True
             raise HTTPException(
-                status_code=422,
+                status_code=503,
                 detail={
                     "code": "geocoder_unavailable",
-                    "message": "Geocoding failed; provide latitude and longitude for map fallback.",
+                    "message": "Geocoding is unavailable; place a point on the map or provide latitude and longitude.",
                 },
             ) from exc
     assert latitude is not None and longitude is not None
     if county and county.casefold().endswith(" county"):
         county = county[:-7].strip()
     health: dict[str, str] = {}
-    candidates = await search_counties(Point(longitude, latitude), county, buffer_meters, health=health)
+    candidates = await search_counties(
+        Point(longitude, latitude),
+        county,
+        buffer_meters,
+        address=address,
+        health=health,
+    )
     return ParcelSearchResponse(
         candidates=[_candidate(parcel) for parcel in candidates],
         latitude=latitude,
