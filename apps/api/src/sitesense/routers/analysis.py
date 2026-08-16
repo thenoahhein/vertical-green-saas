@@ -70,15 +70,25 @@ async def analysis(project_id: UUID, db: AsyncSession = Depends(get_db), org: Cu
         .order_by(AnalysisCategory.created_at.desc())
         .limit(1)
     )
+    hydrology_category = await db.scalar(
+        select(AnalysisCategory)
+        .where(
+            AnalysisCategory.analysis_id == analysis_row.id,
+            AnalysisCategory.category == "hydrology",
+            AnalysisCategory.organization_id == org.organization_id,
+        )
+        .order_by(AnalysisCategory.created_at.desc())
+        .limit(1)
+    )
     metric_result = await db.execute(
         select(DerivedMetric)
         .where(
             DerivedMetric.analysis_id == analysis_row.id,
-            DerivedMetric.category == "terrain",
             DerivedMetric.organization_id == org.organization_id,
         )
     )
     terrain_payload: dict[str, object] = {}
+    hydrology_payload: dict[str, object] = {}
     histogram: dict[str, dict[str, object]] = {}
     for metric in metric_result.scalars():
         if metric.value is None:
@@ -87,7 +97,8 @@ async def analysis(project_id: UUID, db: AsyncSession = Depends(get_db), org: Cu
             _, bucket, suffix = metric.name.split(":", 2)
             histogram.setdefault(bucket, {"bucket": bucket})[suffix] = metric.value
         else:
-            terrain_payload[metric.name] = metric.value
+            target = hydrology_payload if metric.category == "hydrology" else terrain_payload
+            target[metric.name] = metric.value
     if histogram:
         for bucket_payload in histogram.values():
             bucket_payload["percentage_denominator"] = "valid slope pixels"
@@ -111,11 +122,41 @@ async def analysis(project_id: UUID, db: AsyncSession = Depends(get_db), org: Cu
                 "missing_fraction": missing_fraction,
             }
         )
+    hydrology_layers_result = await db.execute(
+        select(AnalysisLayer)
+        .where(
+            AnalysisLayer.analysis_id == analysis_row.id,
+            AnalysisLayer.organization_id == org.organization_id,
+            AnalysisLayer.category == "hydro_wbd_context",
+        )
+    )
+    for layer in hydrology_layers_result.scalars():
+        membership = layer.layer_metadata.get("membership")
+        if isinstance(membership, dict):
+            hydrology_payload["wbd_membership"] = membership
+    if hydrology_payload.get("window_truncation_warning"):
+        warnings.append(
+            {
+                "code": "hydrology_window_truncated",
+                "message": "Flow enters the analysis window boundary; contributing acreage is a lower bound.",
+                "contributing_acres_is_lower_bound": True,
+            }
+        )
+    if hydrology_category is not None:
+        hydrology_payload["status"] = hydrology_category.status.value
+        hydrology_payload["confidence"] = (
+            hydrology_category.confidence.value if hydrology_category.confidence else "low"
+        )
+        hydrology_payload["confidence_reason"] = hydrology_category.confidence_reason
+        hydrology_payload["water_feature_review_label"] = (
+            "potential water-management investigation areas"
+        )
     return AnalysisRead(
         status=category.status.value if category else "unavailable",
         confidence=category.confidence.value if category and category.confidence else "low",
         confidence_reason=category.confidence_reason if category else "Terrain analysis unavailable.",
         terrain=terrain_payload or None,
+        hydrology=hydrology_payload or None,
         warnings=warnings,
     )
 

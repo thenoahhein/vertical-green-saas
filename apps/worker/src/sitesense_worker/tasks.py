@@ -17,6 +17,15 @@ from pyproj import Transformer
 from rasterio.shutil import copy as copy_raster
 from shapely.ops import transform
 from sitesense.config import get_settings
+from sitesense.hydrology import (
+    HYDROGRAPHY_URL,
+    WBD_URL,
+    HydrologySourceError,
+    feature_geometries,
+    fetch_3dhp,
+    fetch_wbd_membership,
+    run_hydrology,
+)
 from sitesense.jobs import transition_job
 from sitesense.models import (
     AnalysisCategory,
@@ -115,6 +124,281 @@ def _source_row(session: Session, product: Any) -> DataSource:
         session.add(source)
         session.flush()
     return source
+
+
+def _reference_source_row(
+    session: Session,
+    *,
+    name: str,
+    agency: str,
+    dataset_name: str,
+    source_url: str,
+    access_method: str,
+    notes: str,
+) -> DataSource:
+    source = session.scalar(select(DataSource).where(DataSource.source_url == source_url))
+    if source is None:
+        source = DataSource(
+            name=name,
+            agency=agency,
+            dataset_name=dataset_name,
+            source_url=source_url,
+            access_method=access_method,
+            retrieved_at=datetime.now(UTC),
+            notes=notes,
+        )
+        session.add(source)
+        session.flush()
+    return source
+
+
+def _source_ref(session: Session, organization_id: Any, source: DataSource, table: str, derived_id: Any) -> None:
+    session.add(
+        AnalysisSourceRef(
+            organization_id=organization_id,
+            data_source_id=source.id,
+            derived_table=table,
+            derived_id=derived_id,
+        )
+    )
+
+
+def _persist_hydrology(
+    session: Session,
+    job: Job,
+    analysis: SiteAnalysis,
+    parcel: Parcel,
+    parcel_projected: Any,
+    inverse: Transformer,
+    hydrology: Any,
+    contributors: tuple[str, ...],
+    buffer_geometry: Any,
+    analysis_buffer_meters: float,
+) -> list[dict[str, object]]:
+    """Persist local hydrology products and return typed warnings."""
+    object_prefix = f"{job.organization_id}/{job.project_id}/analysis/{analysis.id}"
+    category = AnalysisCategory(
+        organization_id=job.organization_id,
+        analysis_id=analysis.id,
+        category="hydrology",
+        status=CategoryStatus.complete,
+        confidence=Confidence.medium if hydrology.warnings else Confidence.high,
+        confidence_reason=(
+            "WhiteboxTools D8 routing scoped to the recorded analysis window."
+            + (" Boundary inflow makes contributing acreage a lower bound." if hydrology.warnings else "")
+        ),
+    )
+    session.add(category)
+    session.flush()
+    units = {
+        "analysis_window_pixel_area_m2": "square_metres",
+        "stream_threshold_cells": "cells",
+        "window_boundary_inflow_cells": "cells",
+        "window_boundary_inflow_max_cells": "cells",
+        "contributing_acres_within_window": "acres",
+        "parcel_acres": "acres",
+        "local_depression_count": "count",
+        "ridge_segment_count": "count",
+        "valley_segment_count": "count",
+        "drainage_line_count": "count",
+        "catchment_count": "count",
+    }
+    for name, value in hydrology.metrics.items():
+        if value is None or not isinstance(value, (bool, int, float)):
+            continue
+        session.add(
+            DerivedMetric(
+                organization_id=job.organization_id,
+                analysis_id=analysis.id,
+                category="hydrology",
+                name=name,
+                value=float(value),
+                unit="boolean" if isinstance(value, bool) else units.get(name, "number"),
+            )
+        )
+    if hydrology.warnings:
+        session.add(
+            DerivedMetric(
+                organization_id=job.organization_id,
+                analysis_id=analysis.id,
+                category="hydrology",
+                name="window_truncation_warning",
+                value=1.0,
+                unit="boolean",
+            )
+        )
+    raster_outputs = {
+        "hydrology_conditioned_dem": hydrology.conditioned,
+        "hydrology_flow_direction": hydrology.flow_direction,
+        "hydrology_flow_accumulation": hydrology.flow_accumulation,
+    }
+    for layer_name, array in raster_outputs.items():
+        key = f"{object_prefix}/{layer_name}.tif"
+        output = np.where(np.isfinite(array), array, -9999.0)
+        _upload(key, _write_cog(output, hydrology.transform, hydrology.crs, -9999.0))
+        layer = AnalysisLayer(
+            organization_id=job.organization_id,
+            analysis_id=analysis.id,
+            category=layer_name,
+            object_store_key=key,
+            layer_metadata={
+                "bounds": list(buffer_geometry.bounds),
+                "crs": hydrology.crs,
+                "resolution_m": abs(hydrology.transform.a),
+                "nodata": -9999.0,
+                "analysis_window_buffer_m": analysis_buffer_meters,
+                "analysis_scope": "within analysis window",
+                "source_urls": list(contributors),
+            },
+        )
+        session.add(layer)
+        session.flush()
+        for source in session.scalars(
+            select(DataSource).where(DataSource.source_url.in_(contributors))
+        ):
+            _source_ref(session, job.organization_id, source, "analysis_layers", layer.id)
+
+    def add_geometry_layer(category_name: str, geometry: Any, metadata: dict[str, object]) -> None:
+        projected = transform(inverse.transform, geometry)
+        layer = AnalysisLayer(
+            organization_id=job.organization_id,
+            analysis_id=analysis.id,
+            category=category_name,
+            geometry=from_shape(projected, srid=4326),
+            layer_metadata=metadata,
+        )
+        session.add(layer)
+        session.flush()
+        for source in session.scalars(
+            select(DataSource).where(DataSource.source_url.in_(contributors))
+        ):
+            _source_ref(session, job.organization_id, source, "analysis_layers", layer.id)
+
+    for line in hydrology.drainage_lines:
+        add_geometry_layer(
+            "hydrology_drainage_lines",
+            line,
+            {
+                "threshold_cells": hydrology.metrics["stream_threshold_cells"],
+                "analysis_scope": "within analysis window",
+                "potential_water_management_review_required": True,
+            },
+        )
+    for polygon in hydrology.catchments:
+        add_geometry_layer(
+            "hydrology_local_catchments",
+            polygon,
+            {"analysis_scope": "within analysis window"},
+        )
+    for polygon in hydrology.depressions:
+        add_geometry_layer(
+            "hydrology_local_depressions",
+            polygon,
+            {
+                "label": "potential water-management investigation area",
+                "requires_contractor_review": True,
+            },
+        )
+    for line in hydrology.ridgelines:
+        add_geometry_layer(
+            "hydrology_ridgelines",
+            line,
+            {"requires_contractor_review": True},
+        )
+    for line in hydrology.valleys:
+        add_geometry_layer(
+            "hydrology_major_valleys",
+            line,
+            {"requires_contractor_review": True},
+        )
+    for corridor in hydrology.corridors:
+        add_geometry_layer(
+            "hydrology_corridors",
+            corridor.geometry,
+            {
+                "contributing_acres_within_window": corridor.contributing_acres,
+                "parcel_acres_intersected": corridor.parcel_acres_intersected,
+                "flow_direction_degrees": corridor.flow_direction_degrees,
+                "mapped_water_relationship": corridor.mapped_water_relationship,
+                "contributing_acres_is_lower_bound": bool(
+                    hydrology.metrics["contributing_acres_is_lower_bound"]
+                ),
+            },
+        )
+    return list(hydrology.warnings)
+
+
+def _persist_reference_layers(
+    session: Session,
+    job: Job,
+    analysis: SiteAnalysis,
+    bbox: tuple[float, float, float, float],
+    centroid: tuple[float, float],
+) -> list[dict[str, object]]:
+    warnings: list[dict[str, object]] = []
+    try:
+        features = fetch_3dhp(bbox)
+        hydro_source = _reference_source_row(
+            session,
+            name="USGS 3DHP",
+            agency="USGS",
+            dataset_name="3D Hydrography Program",
+            source_url=HYDROGRAPHY_URL,
+            access_method="arcgis-feature-service",
+            notes="JSON-queryable reference hydrography; Catchment may be unavailable locally.",
+        )
+        categories = {20: "hydro_3dhp_hydrolocations", 30: "hydro_3dhp_hydrolocations", 40: "hydro_3dhp_hydrolocations", 50: "hydro_3dhp_flowlines", 60: "hydro_3dhp_waterbodies", 80: "hydro_3dhp_catchments"}
+        for layer_id, layer_features in features.items():
+            for feature in layer_features:
+                geometries = feature_geometries([feature])
+                if not geometries:
+                    continue
+                layer = AnalysisLayer(
+                    organization_id=job.organization_id,
+                    analysis_id=analysis.id,
+                    category=categories[layer_id],
+                    geometry=from_shape(geometries[0], srid=4326),
+                    layer_metadata={
+                        "source_layer": layer_id,
+                        "attributes": feature.get("attributes", {}),
+                        "reference_only": True,
+                    },
+                )
+                session.add(layer)
+                session.flush()
+                _source_ref(session, job.organization_id, hydro_source, "analysis_layers", layer.id)
+        if not features.get(80):
+            warnings.append(
+                {
+                    "code": "hydro_3dhp_catchment_unavailable",
+                    "message": "3DHP Catchment reference data was unavailable for this analysis area.",
+                }
+            )
+    except HydrologySourceError as exc:
+        warnings.append({"code": "hydro_3dhp_unavailable", "message": str(exc)})
+    try:
+        membership = fetch_wbd_membership(*centroid)
+        wbd_source = _reference_source_row(
+            session,
+            name="USGS WBD",
+            agency="USGS",
+            dataset_name="Watershed Boundary Dataset",
+            source_url=WBD_URL,
+            access_method="arcgis-map-service",
+            notes="HUC10/HUC12 point membership; regional context only.",
+        )
+        layer = AnalysisLayer(
+            organization_id=job.organization_id,
+            analysis_id=analysis.id,
+            category="hydro_wbd_context",
+            layer_metadata={"reference_only": True, "membership": membership},
+        )
+        session.add(layer)
+        session.flush()
+        _source_ref(session, job.organization_id, wbd_source, "analysis_layers", layer.id)
+    except HydrologySourceError as exc:
+        warnings.append({"code": "hydro_wbd_unavailable", "message": str(exc)})
+    return warnings
 
 
 def _set_job(session: Session, job: Job, stage: JobStage, statuses: dict[str, str], detail: str | None = None) -> None:
@@ -329,14 +613,98 @@ def _terrain_analysis(session: Session, job: Job) -> None:
                 name="coverage_missing_fraction",
                 value=float(result.warning["missing_fraction"]),
                 unit="fraction",
+                )
+            )
+    hydrology_warnings: list[dict[str, object]] = []
+    hydrology_buffer_meters = DEFAULT_TERRAIN_BUFFER_METERS
+    try:
+        hydrology_result = run_hydrology(
+            elevation,
+            grid_transform,
+            grid_crs,
+            parcel_projected,
+            parcel.computed_acres,
+        )
+        if hydrology_result.warnings:
+            hydrology_buffer_meters = 2000.0
+            expanded_projected = parcel_projected.buffer(hydrology_buffer_meters)
+            expanded_wgs84 = transform(inverse.transform, expanded_projected)
+            expanded_bounds: tuple[float, float, float, float] = (
+                float(expanded_wgs84.bounds[0]),
+                float(expanded_wgs84.bounds[1]),
+                float(expanded_wgs84.bounds[2]),
+                float(expanded_wgs84.bounds[3]),
+            )
+            expanded_selection = select_products(expanded_bounds)
+            if expanded_selection.products:
+                expanded_elevation, expanded_transform, expanded_crs, expanded_contributors = read_mosaic(
+                    expanded_selection.products,
+                    expanded_bounds,
+                    "EPSG:26914",
+                )
+                hydrology_result = run_hydrology(
+                    expanded_elevation,
+                    expanded_transform,
+                    expanded_crs,
+                    parcel_projected,
+                    parcel.computed_acres,
+                )
+                buffered_projected = expanded_projected
+                buffered_bounds = expanded_bounds
+                contributors = expanded_contributors
+                for product in expanded_selection.products:
+                    if product.source_url not in [source.source_url for source in sources]:
+                        sources.append(_source_row(session, product))
+        hydrology_warnings.extend(
+            _persist_hydrology(
+                session,
+                job,
+                analysis,
+                parcel,
+                parcel_projected,
+                inverse,
+                hydrology_result,
+                contributors,
+                buffered_projected,
+                hydrology_buffer_meters,
             )
         )
+        hydrology_warnings.extend(
+            _persist_reference_layers(
+                session,
+                job,
+                analysis,
+                buffered_bounds,
+                (float(source_geometry.centroid.x), float(source_geometry.centroid.y)),
+            )
+        )
+    except HydrologySourceError as exc:
+        hydrology_warnings.append({"code": "hydrology_unavailable", "message": str(exc)})
+        session.add(
+            AnalysisCategory(
+                organization_id=job.organization_id,
+                analysis_id=analysis.id,
+                category="hydrology",
+                status=CategoryStatus.unavailable,
+                confidence=Confidence.low,
+                confidence_reason=str(exc),
+            )
+        )
+    all_warnings = ([result.warning] if result.warning else []) + hydrology_warnings
     _set_job(
         session,
         job,
-        JobStage.partial if result.warning else JobStage.complete,
-        {"terrain": "complete"},
-        result.warning["message"] if result.warning else selection.warning,
+        JobStage.partial if all_warnings else JobStage.complete,
+        {
+            "terrain": "complete",
+            "hydrology": "partial" if hydrology_warnings else "complete",
+        },
+        "; ".join(
+            str(warning.get("message"))
+            for warning in all_warnings
+            if warning and warning.get("message")
+        )
+        or selection.warning,
     )
 
 

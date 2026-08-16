@@ -16,6 +16,12 @@ REQUIRED_FIELDS = {
     "mean_slope_percent",
     "slope_histogram",
 }
+HYDROLOGY_FIELDS = {
+    "contributing_acres_within_window",
+    "window_truncated",
+    "drainage_line_count",
+    "catchment_count",
+}
 
 
 async def run() -> None:
@@ -44,12 +50,17 @@ async def run() -> None:
             analysis = await client.get(f"/api/projects/{project_id}/analysis")
             analysis.raise_for_status()
             terrain = analysis.json().get("terrain") or {}
+            hydrology = analysis.json().get("hydrology") or {}
             elapsed = time.perf_counter() - started
             missing = sorted(REQUIRED_FIELDS - terrain.keys())
+            missing_hydrology = sorted(HYDROLOGY_FIELDS - hydrology.keys())
             print(
                 f"{case['county']} {case['expected_parcel_id']} "
                 f"seconds={elapsed:.2f} coverage={terrain.get('coverage_fraction')} "
-                f"all_required={not missing} missing={','.join(missing)}"
+                f"terrain_required={not missing} missing={','.join(missing)} "
+                f"hydrology_required={not missing_hydrology} "
+                f"hydrology_truncated={hydrology.get('window_truncated')} "
+                f"missing_hydrology={','.join(missing_hydrology)}"
             )
 
 

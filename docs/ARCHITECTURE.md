@@ -123,3 +123,41 @@ produces a typed source-unavailable warning while the job remains partial.
 Hydrologically conditioned terrain products are intentionally not part of this
 milestone. Local depressions, ridgelines, valleys, and terrain-derived drainage
 networks require flow routing and belong to Milestone 3.
+
+## Hydrology analysis
+
+Milestone 3 extends the terrain job with WhiteboxTools 2.3.6. The API and
+worker images warm the MIT-licensed executable during image build; request
+processing fails with a typed configuration error if the executable is absent
+and never downloads it on demand. The measured Whitebox workflow was 0.64
+seconds and approximately 69 MB for a 1,402-by-1,402 window, versus 1.14
+seconds and approximately 103 MB for a 1,900-by-1,900 window. PySheds was
+approximately ten times slower and five times more memory-intensive in the
+same probe, and its accumulation path currently calls the removed NumPy 2.5
+`in1d` symbol. RichDEM does not build on Python 3.12. A straightforward
+Python priority-flood implementation alone took approximately 32 seconds on
+2,000-by-2,000 cells, so it is not used in the request path.
+
+Hydrology rasters are staged in a cleaned per-job directory because
+WhiteboxTools uses file paths: conditioned DEM, D8 pointer, D8 accumulation,
+stream raster, and local subbasins are persisted as COGs or vector layers.
+Drainage extraction uses an explicit accumulation threshold recorded in layer
+metadata. Depressions, ridgelines, valleys, catchments, and corridor
+statistics are local-window products and are not authoritative watershed
+delineations.
+
+Contributing acreage is always labeled `within analysis window`. Boundary
+inflow is detected from accumulation values at the analysis-window edge. When
+significant inflow is present, the value is a lower bound and the payload
+emits `hydrology_window_truncated`; one bounded expansion from the default
+500-meter buffer to 2 kilometers is attempted. The system never publishes a
+bare parcel-scale watershed acreage from a local window. WBD HUC10/HUC12
+membership is regional context only, and the absence of a local 3DHP
+Catchment feature is recorded as unavailable rather than treated as proof of
+no upstream watershed.
+
+USGS 3DHP flowlines, waterbodies, and hydrolocations are stored as reference
+layers with independent provenance. Terrain-derived depressions and water
+features are labeled **potential water-management investigation areas** and
+require contractor review; the analysis does not recommend building a pond or
+other feature.
