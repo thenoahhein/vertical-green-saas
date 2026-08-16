@@ -42,7 +42,26 @@ export type ConfirmedParcel = {
   disclaimer: string;
 };
 
+export type Project = {
+  id: string;
+  name: string;
+  client_id: string | null;
+  organization_id: string;
+};
+
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000/api";
+
+export class ApiError extends Error {
+  readonly status: number;
+  readonly code: string | null;
+
+  constructor(message: string, status: number, code: string | null = null) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.code = code;
+  }
+}
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
@@ -50,9 +69,42 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     headers: { Authorization: "Bearer dev-token", "Content-Type": "application/json", ...init?.headers },
   });
   if (!response.ok) {
-    throw new Error(`API request failed (${response.status})`);
+    let detail: unknown;
+    try {
+      detail = await response.json();
+    } catch {
+      detail = null;
+    }
+    if (
+      typeof detail === "object" &&
+      detail !== null &&
+      "detail" in detail &&
+      typeof detail.detail === "object" &&
+      detail.detail !== null &&
+      "message" in detail.detail &&
+      typeof detail.detail.message === "string"
+    ) {
+      const typedDetail = detail.detail as { code?: unknown; message: string };
+      throw new ApiError(
+        typedDetail.message,
+        response.status,
+        typeof typedDetail.code === "string" ? typedDetail.code : null,
+      );
+    }
+    throw new ApiError(`API request failed (${response.status})`, response.status);
   }
   return response.json() as Promise<T>;
+}
+
+export function listProjects(): Promise<Project[]> {
+  return request<Project[]>("/projects");
+}
+
+export function createProject(name: string): Promise<Project> {
+  return request<Project>("/projects", {
+    method: "POST",
+    body: JSON.stringify({ name }),
+  });
 }
 
 export function searchParcels(query: { address?: string; latitude?: number; longitude?: number }): Promise<ParcelSearchResponse> {
