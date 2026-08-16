@@ -37,6 +37,8 @@ class AnalysisRead(BaseModel):
     confidence_reason: str
     terrain: dict[str, object] | None = None
     hydrology: dict[str, object] | None = None
+    soils: dict[str, object] | None = None
+    ecology: dict[str, object] | None = None
     warnings: list[dict[str, object]] = Field(default_factory=list)
 
 
