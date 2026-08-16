@@ -12,9 +12,12 @@ class Settings(BaseSettings):
     dev_user_id: str = "00000000-0000-0000-0000-000000000002"
     object_store_endpoint: str = "http://localhost:9000"
     object_store_bucket: str = "sitesense"
+    cors_allowed_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
+
+    def allowed_origins(self) -> list[str]:
+        return [origin.strip() for origin in self.cors_allowed_origins.split(",") if origin.strip()]
 
 
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
-

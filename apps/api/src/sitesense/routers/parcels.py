@@ -174,6 +174,25 @@ async def confirm_parcel(
         )
     )
     existing = existing_result.scalar_one_or_none()
+    project_parcel_result = await db.execute(
+        select(Parcel)
+        .join(Property, Parcel.property_id == Property.id)
+        .where(
+            Parcel.organization_id == org.organization_id,
+            Property.project_id == project_id,
+        )
+    )
+    project_parcel = project_parcel_result.scalar_one_or_none()
+    if project_parcel is not None and (
+        existing is None or project_parcel.id != existing.id
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "project_already_has_property",
+                "message": "This project already has a confirmed property; create a new project to confirm another parcel.",
+            },
+        )
     geometry = _geometry(candidate.geometry)
     computed_acres = acreage(geometry)
     if existing is None:

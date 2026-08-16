@@ -16,6 +16,19 @@ def _headers() -> dict[str, str]:
     return {"Authorization": "Bearer dev-token"}
 
 
+def test_cors_preflight_allows_local_web_origin() -> None:
+    response = TestClient(app).options(
+        "/api/parcel-search",
+        headers={
+            "Origin": "http://localhost:3000",
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "authorization",
+        },
+    )
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "http://localhost:3000"
+
+
 def _candidate() -> NormalizedParcel:
     polygon = Polygon([(-97.0, 30.0), (-97.0, 30.001), (-96.999, 30.001), (-96.999, 30.0), (-97.0, 30.0)])
     return NormalizedParcel(
@@ -81,6 +94,15 @@ def test_search_and_confirm_persist_provenance(
     )
     assert repeated.status_code == 201
     assert repeated.json()["parcel_id"] == confirmed.json()["parcel_id"]
+    different_candidate = payload["candidates"][0].copy()
+    different_candidate["parcel_id"] = "PROP-2"
+    conflict = client.post(
+        f"/api/projects/{project_id}/parcel",
+        json={"candidate": different_candidate},
+        headers=_headers(),
+    )
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"]["code"] == "project_already_has_property"
 
     async def assert_ref() -> None:
         async with db_sessionmaker() as session:
