@@ -231,3 +231,42 @@ layers with independent provenance. Terrain-derived depressions and water
 features are labeled **potential water-management investigation areas** and
 require contractor review; the analysis does not recommend building a pond or
 other feature.
+
+## Soils and ecology analysis
+
+The soils slice uses the USDA NRCS Soil Data Access (SDA) service over its
+HTTP POST SQL endpoint with the validated SSURGO map-unit and component
+queries. The confirmed parcel is submitted as the Query A AOI. SDA currently
+accepts the native WGS84 `MULTIPOLYGON` WKT used by confirmed parcels; the
+adapter records the submitted AOI acreage and uses a bounded, precision-reduced
+or simplified AOI when a pathological vertex count would exceed the query-size
+bound. Coverage is reconciled against the AOI actually submitted, while unit
+percentages remain relative to the confirmed parcel. Computed areas use
+EPSG:6579, and SDA-reported acreage remains separate provenance metadata.
+
+Each SSURGO map unit retains every returned component. Single-valued fields and
+the contractor-facing hydrologic-group, drainage-class, surface-ksat, and
+representative-slope metrics use the component with the highest `comppct_r`
+within that map unit. These are dominant-component planning summaries, not
+area-weighted whole-parcel soil truths; the rule is recorded in layer and
+category metadata. Missing SDA values remain null. Coverage below 99 percent
+is a typed partial warning, while no map units or an upstream failure produces
+a typed unavailable category.
+
+Ecology uses only the TPWD Ecological Mapping Systems 2020 vector MapServer,
+never NLCD or raster/WMTS classification. Candidate ecoregion layers are
+probed through their layer metadata before querying. The launch service schema
+uses `CommonName` for the vegetation type and `Veg_ID` for the source
+classification code; a schema change is a typed source error rather than an
+unclassified fallback. ArcGIS transfer limits are handled with bounded
+`resultOffset`/`resultRecordCount` pagination. Returned polygons are clipped
+to the parcel and measured in EPSG:6579. Multipart ArcGIS rings are grouped
+using their orientation so separate exteriors and holes are not collapsed
+into a false donut. If some candidate layers fail while others answer, the
+available result is retained with a typed partial warning naming failed layer
+IDs; failure of all candidates is unavailable.
+
+Both categories are preliminary planning outputs requiring field verification
+and professional review. They do not make engineering-grade suitability
+claims. Each persisted unit and layer has explicit upstream provenance, source
+metadata, coverage or answered-layer context, and stage timings.

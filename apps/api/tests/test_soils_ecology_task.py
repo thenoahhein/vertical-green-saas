@@ -7,7 +7,16 @@ from uuid import UUID
 import pytest
 from shapely.geometry import box
 from sitesense.ecology import EcologicalUnitResult, EcologyResult
-from sitesense.models import AnalysisSourceRef, EcologicalUnit, Job, Project, SiteAnalysis, SoilUnit
+from sitesense.models import (
+    AnalysisCategory,
+    AnalysisSourceRef,
+    CategoryStatus,
+    EcologicalUnit,
+    Job,
+    Project,
+    SiteAnalysis,
+    SoilUnit,
+)
 from sitesense.soils import SoilComponent, SoilsResult, SoilUnitResult
 from sitesense_worker.tasks import _persist_ecology, _persist_soils
 from sqlalchemy import select
@@ -28,7 +37,7 @@ async def test_soils_and_ecology_persistence_has_provenance(
         analysis = SiteAnalysis(organization_id=organization_id, project_id=project.id)
         async_session.add_all([job, analysis])
         await async_session.commit()
-        job_id, analysis_id = job.id, analysis.id
+        job_id, analysis_id, parcel_id = job.id, analysis.id, analysis.parcel_id
 
     geometry = box(-97.0, 30.0, -96.999, 30.001)
     component = SoilComponent(
@@ -90,3 +99,32 @@ async def test_soils_and_ecology_persistence_has_provenance(
             )
         ).all()
         assert len(refs) == 4
+
+        rerun = SiteAnalysis(
+                organization_id=organization_id,
+                project_id=project.id,
+                parcel_id=parcel_id,
+        )
+        async_session.add(rerun)
+        await async_session.flush()
+        async_session.add(
+            AnalysisCategory(
+                organization_id=organization_id,
+                analysis_id=rerun.id,
+                category="soils",
+                status=CategoryStatus.unavailable,
+                confidence_reason="SDA unavailable on rerun",
+            )
+        )
+        await async_session.commit()
+        assert rerun.id != analysis_id
+        assert await async_session.scalar(select(SoilUnit).where(SoilUnit.analysis_id == rerun.id)) is None
+        assert await async_session.scalar(
+            select(EcologicalUnit).where(EcologicalUnit.analysis_id == rerun.id)
+        ) is None
+        assert await async_session.scalar(
+            select(AnalysisCategory).where(
+                AnalysisCategory.analysis_id == rerun.id,
+                AnalysisCategory.category == "soils",
+            )
+        ) is not None

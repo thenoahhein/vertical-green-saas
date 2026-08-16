@@ -271,7 +271,11 @@ def _persist_soils(
         category="soils",
         status=CategoryStatus.complete,
         confidence=Confidence.medium,
-        confidence_reason="SSURGO map units and dominant components are preliminary planning data requiring field verification and professional review.",
+        confidence_reason=(
+            "SSURGO map units and dominant components are preliminary planning data requiring "
+            "field verification and professional review. Hydrologic group, drainage class, "
+            "surface ksat, and slope metrics use each map unit's dominant component."
+        ),
     )
     session.add(category)
     session.flush()
@@ -365,6 +369,12 @@ def _persist_soils(
                     for component in unit.components
                 ],
                 "stage_timings": result.stage_timings,
+                "dominant_component_rule": (
+                    "Hydrologic group, drainage class, surface ksat, and slope metrics use "
+                    "the component with the highest comppct_r within each map unit."
+                ),
+                "aoi_acres": result.metrics.get("aoi_acres"),
+                "aoi_geometry_method": result.metrics.get("aoi_geometry_method", "native_wkt"),
                 "preliminary_planning_only": True,
             },
         )
@@ -394,7 +404,10 @@ def _persist_ecology(
         category="ecology",
         status=CategoryStatus.complete,
         confidence=Confidence.medium,
-        confidence_reason="TPWD EMS 2020 vector classifications are preliminary planning data requiring field verification and professional review.",
+        confidence_reason=(
+            "TPWD EMS 2020 vector classifications are preliminary planning data requiring "
+            "field verification and professional review."
+        ),
     )
     session.add(category)
     session.flush()
@@ -444,6 +457,9 @@ def _persist_ecology(
                 "acres": unit.acres,
                 "parcel_percent": unit.parcel_percent,
                 "stage_timings": result.stage_timings,
+                "answered_layer_ids": list(result.answered_layers),
+                "pinned_fields": {"vegetation_type": "CommonName", "classification_code": "Veg_ID"},
+                "warnings": result.warnings,
                 "preliminary_planning_only": True,
             },
         )

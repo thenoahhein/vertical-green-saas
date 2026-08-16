@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -15,6 +16,8 @@ from sitesense.geo import acreage
 
 SDA_URL = "https://SDMDataAccess.sc.egov.usda.gov/Tabular/post.rest"
 SDA_DATASET = "USDA SSURGO Soil Data Access"
+MAX_AOI_WKT_CHARS = 7000
+MUKEY_PATTERN = re.compile(r"^\d+$")
 
 QUERY_A = """~DeclareGeometry(@aoi)~
 SELECT @aoi = geometry::STGeomFromText('{wkt}', 4326)
@@ -94,6 +97,27 @@ class SoilsResult:
     stage_timings: dict[str, float]
 
 
+def _prepare_aoi(parcel_geometry: BaseGeometry) -> tuple[BaseGeometry, list[dict[str, Any]]]:
+    """Bound SDA's AOI while recording any geometry transformation."""
+    precise = wkt.loads(wkt.dumps(parcel_geometry, rounding_precision=6, trim=True))
+    if len(precise.wkt) <= MAX_AOI_WKT_CHARS:
+        return precise, []
+    for tolerance in (1e-7, 5e-7, 1e-6, 5e-6):
+        simplified = precise.simplify(tolerance, preserve_topology=True)
+        if len(simplified.wkt) <= MAX_AOI_WKT_CHARS:
+            return simplified, [{
+                "code": "soils_aoi_simplified",
+                "message": "SDA AOI coordinates were simplified to remain within the query size bound.",
+                "aoi_geometry_method": f"simplified_{tolerance:g}_degrees",
+            }]
+    envelope = precise.envelope
+    return envelope, [{
+        "code": "soils_aoi_envelope_fallback",
+        "message": "SDA AOI was reduced to its bounding envelope to remain within the query size bound.",
+        "aoi_geometry_method": "envelope",
+    }]
+
+
 def _rows(payload: Any, label: str) -> list[dict[str, Any]]:
     if not isinstance(payload, dict) or not isinstance(payload.get("Table"), list):
         raise SoilsSourceError(f"SDA {label} response had an unexpected shape.")
@@ -159,19 +183,32 @@ def run_soils(parcel_geometry: BaseGeometry, parcel_acres: float, client: httpx.
     http_client = client or httpx.Client(timeout=20.0)
     close_client = client is None
     try:
+        aoi_geometry, aoi_warnings = _prepare_aoi(parcel_geometry)
+        aoi_acres = acreage(aoi_geometry)
         started = time.perf_counter()
-        map_rows = _post(QUERY_A.format(wkt=parcel_geometry.wkt), http_client, "map-unit")
+        map_rows = _post(QUERY_A.format(wkt=aoi_geometry.wkt), http_client, "map-unit")
         timings["map_unit_query"] = time.perf_counter() - started
         if not map_rows:
             return SoilsResult(
-                [], {"parcel_acres": parcel_acres, "coverage_fraction": 0.0},
-                [{"code": "soils_source_unavailable", "message": "SDA returned no map units for the parcel."}],
+                [],
+                {
+                    "parcel_acres": parcel_acres,
+                    "aoi_acres": aoi_acres,
+                    "coverage_fraction": 0.0,
+                    "aoi_geometry_method": "native_wkt" if not aoi_warnings else aoi_warnings[-1]["aoi_geometry_method"],
+                },
+                aoi_warnings + [{
+                    "code": "soils_source_unavailable",
+                    "message": "SDA returned no map units for the parcel AOI.",
+                }],
                 SDA_URL, retrieved_at, timings,
             )
         required = {"mukey", "musym", "muname", "acres", "wkt"}
         if any(not required.issubset(row) for row in map_rows):
             raise SoilsSourceError("SDA map-unit response is missing required columns.")
         mukeys = tuple(dict.fromkeys(str(row["mukey"]) for row in map_rows))
+        if any(not MUKEY_PATTERN.fullmatch(mukey) for mukey in mukeys):
+            raise SoilsSourceError("SDA returned a non-numeric mukey.")
         started = time.perf_counter()
         component_rows = _post(
             QUERY_B.format(mukeys=", ".join(f"'{mukey}'" for mukey in mukeys)),
@@ -206,11 +243,12 @@ def run_soils(parcel_geometry: BaseGeometry, parcel_acres: float, client: httpx.
         timings["clipping_and_metrics"] = time.perf_counter() - started
         covered = sum(unit.acres for unit in units)
         warnings: list[dict[str, Any]] = []
-        if parcel_acres and covered / parcel_acres < 0.99:
+        warnings.extend(aoi_warnings)
+        if aoi_acres and covered / aoi_acres < 0.99:
             warnings.append({
                 "code": "soils_coverage_incomplete",
-                "message": "SSURGO clipped map units cover less than 99% of the parcel.",
-                "coverage_fraction": covered / parcel_acres,
+                "message": "SSURGO clipped map units cover less than 99% of the submitted SDA AOI.",
+                "coverage_fraction": covered / aoi_acres,
             })
         hydrologic_groups: dict[str, float] = {}
         drainage: dict[str, float] = {}
@@ -225,7 +263,9 @@ def run_soils(parcel_geometry: BaseGeometry, parcel_acres: float, client: httpx.
         metrics: dict[str, Any] = {
             "parcel_acres": parcel_acres,
             "covered_acres": covered,
-            "coverage_fraction": covered / parcel_acres if parcel_acres else 0,
+            "aoi_acres": aoi_acres,
+            "coverage_fraction": covered / aoi_acres if aoi_acres else 0,
+            "aoi_geometry_method": "native_wkt" if not aoi_warnings else aoi_warnings[-1]["aoi_geometry_method"],
             "hydrologic_group_acres": hydrologic_groups,
             "dominant_hydrologic_group": (
                 max(hydrologic_groups, key=lambda name: hydrologic_groups[name])

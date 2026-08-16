@@ -4,8 +4,14 @@ import json
 
 import httpx
 import pytest
-from shapely.geometry import box
-from sitesense.soils import QUERY_A, QUERY_B, SoilsSourceError, run_soils
+from shapely.geometry import Polygon, box
+from sitesense.soils import (
+    QUERY_A,
+    QUERY_B,
+    SoilsSourceError,
+    _prepare_aoi,
+    run_soils,
+)
 
 
 class FakeSdaClient:
@@ -86,12 +92,29 @@ def test_soils_dominant_component_nulls_and_reconciliation() -> None:
     assert result.units[0].dominant_component.name == "Dominant"
     assert result.units[0].dominant_component.depth_to_restrictive_layer is None
     assert result.metrics["covered_acres"] > 0
-    assert result.metrics["coverage_fraction"] < 0.99
-    assert any(warning["code"] == "soils_coverage_incomplete" for warning in result.warnings)
+    assert result.metrics["coverage_fraction"] >= 0.99
     assert "JSON+COLUMNNAME" not in client.queries[0]
     assert QUERY_A.splitlines()[0] in client.queries[0]
     assert "WHERE mu.mukey IN ('1', '2')" in client.queries[1]
     assert QUERY_B.splitlines()[0] in client.queries[1]
+
+
+def test_soils_partial_coverage_warning_uses_submitted_aoi() -> None:
+    payload = _map_units()
+    rows = payload["Table"]
+    assert isinstance(rows, list)
+    rows.pop()
+    components = _components()
+    component_rows = components["Table"]
+    assert isinstance(component_rows, list)
+    components["Table"] = [row for row in component_rows if row["mukey"] == "1"]
+    result = run_soils(
+        box(-97.0, 30.0, -96.998, 30.001),
+        1.0,
+        FakeSdaClient([payload, components]),
+    )
+    assert result.metrics["coverage_fraction"] < 0.99
+    assert result.warnings[0]["code"] == "soils_coverage_incomplete"
 
 
 def test_soils_no_map_units_is_unavailable_warning() -> None:
@@ -110,3 +133,26 @@ def test_soils_upstream_failure_is_typed() -> None:
 
     with pytest.raises(SoilsSourceError):
         run_soils(box(-97.0, 30.0, -96.998, 30.001), 1.0, BrokenClient())  # type: ignore[arg-type]
+
+
+def test_soils_rejects_non_numeric_mukey() -> None:
+    payload = _map_units()
+    payload["Table"][0]["mukey"] = "1'; DROP TABLE mapunit;--"  # type: ignore[index]
+    with pytest.raises(SoilsSourceError, match="non-numeric mukey"):
+        run_soils(
+            box(-97.0, 30.0, -96.998, 30.001),
+            1.0,
+            FakeSdaClient([payload]),
+        )
+
+
+def test_soils_bounds_large_aoi_and_reports_geometry_method() -> None:
+    coordinates = [
+        (-97.0 + index * 0.000001, 30.0 + (index % 2) * 0.001)
+        for index in range(5000)
+    ]
+    geometry = Polygon(coordinates + [coordinates[0]])
+    bounded, warnings = _prepare_aoi(geometry)
+    assert len(bounded.wkt) <= 7000
+    assert warnings
+    assert warnings[0]["code"] in {"soils_aoi_simplified", "soils_aoi_envelope_fallback"}
