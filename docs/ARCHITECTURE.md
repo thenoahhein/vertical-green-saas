@@ -148,8 +148,14 @@ delineations.
 
 The D8 accumulation operation is explicitly invoked with Whitebox's `pntr`
 flag because its input is the D8 pointer raster, not an elevation raster.
-Accumulation output is therefore measured in cells (`out_type=cells`). The
-default stream threshold is 100 cells for the 1-meter DEM workflow.
+Accumulation output is therefore measured in cells (`out_type=cells`), but the
+stream threshold is specified as a contributing area rather than a cell count.
+The default is 8,093.7 m² (2 acres), a contractor-scale channel screening
+threshold for Central Texas landscapes. It is converted to the smallest
+whole-cell count that meets that area on each routing grid and both the area
+threshold and applied cell count are recorded in layer metadata. Thus the
+5-meter expansion uses 324 cells for the same 2-acre threshold, while the
+1-meter local grid uses 8,094 cells.
 
 Hydrology products are filtered rather than dissolved into a single geometry.
 The named defaults for 1-meter lidar are:
@@ -160,9 +166,11 @@ The named defaults for 1-meter lidar are:
 
 Each retained depression is persisted separately with fill depth and an
 estimated filled volume. Each retained catchment remains a partition feature,
-and each retained ridge/valley remains a centerline feature. Applied minimums
-are recorded in layer metadata, so omitted small features are distinguishable
-from missing analysis output. Raster masks for ridges and valleys are traced
+and each retained ridge/valley remains a centerline feature. Multipart
+geometries expose their part counts in metrics and layer metadata rather than
+being mistaken for one simple feature. Applied minimums are recorded in layer
+metadata, so omitted small features are distinguishable from missing analysis
+output. Raster masks for ridges and valleys are traced
 through cell centers and filtered by length; polygon boundaries are never used
 as their line representation.
 

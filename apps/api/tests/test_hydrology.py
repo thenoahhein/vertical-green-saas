@@ -16,6 +16,7 @@ from sitesense.hydrology import (
     fetch_3dhp,
     fetch_wbd_membership,
     run_hydrology,
+    stream_threshold_cells_for_resolution,
     whitebox_binary_path,
 )
 
@@ -91,6 +92,16 @@ def test_boundary_inflow_uses_d8_direction_not_boundary_accumulation() -> None:
     inward = np.zeros((3, 3), dtype="float32")
     inward[0, 1] = 64  # south, into the window from the top edge
     assert boundary_inflow_mask(inward)[0, 1]
+
+
+def test_stream_threshold_preserves_contributing_area_across_resolutions() -> None:
+    area_m2 = 8093.7128448
+    one_m = stream_threshold_cells_for_resolution(1.0, area_m2)
+    five_m = stream_threshold_cells_for_resolution(5.0, area_m2)
+    assert one_m == 8094
+    assert five_m == 324
+    assert one_m * 1.0**2 >= area_m2
+    assert five_m * 5.0**2 >= area_m2
 
 def test_missing_whitebox_binary_is_typed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("sitesense.hydrology.whitebox_binary_path", lambda: (_ for _ in ()).throw(WhiteboxBinaryError("missing")))

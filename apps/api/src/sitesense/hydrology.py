@@ -23,7 +23,7 @@ from shapely.ops import linemerge, unary_union
 from sitesense.terrain import valid_data_mask
 
 ACRE_SQUARE_METERS = 4046.8564224
-DEFAULT_STREAM_THRESHOLD_CELLS = 100
+DEFAULT_STREAM_THRESHOLD_AREA_M2 = 8093.7128448  # 2 acres for contractor-scale channels
 DEFAULT_WINDOW_INFLOW_THRESHOLD_CELLS = 100
 MIN_DEPRESSION_AREA_M2 = 9.0
 MIN_DEPRESSION_DEPTH_M = 0.3
@@ -252,6 +252,13 @@ def _cap_lines(
     return sorted(lines, key=lambda line: line.length, reverse=True)[:MAX_RETAINED_LINES], True
 
 
+def stream_threshold_cells_for_resolution(
+    resolution_m: float,
+    threshold_area_m2: float = DEFAULT_STREAM_THRESHOLD_AREA_M2,
+) -> int:
+    return max(1, math.ceil(threshold_area_m2 / (resolution_m * resolution_m)))
+
+
 def _depression_features(
     polygons: list[Polygon],
     elevation: np.ndarray,
@@ -354,13 +361,19 @@ def run_hydrology(
     parcel_geometry: Any,
     parcel_acres: float | None,
     *,
-    stream_threshold_cells: int = DEFAULT_STREAM_THRESHOLD_CELLS,
+    stream_threshold_area_m2: float = DEFAULT_STREAM_THRESHOLD_AREA_M2,
+    stream_threshold_cells: int | None = None,
     inflow_threshold_cells: int = DEFAULT_WINDOW_INFLOW_THRESHOLD_CELLS,
 ) -> HydrologyResult:
     """Run the complete local routing workflow in a cleaned per-job directory."""
     workflow_started = time.perf_counter()
     stage_timings: dict[str, float] = {}
     binary_version = whitebox_binary_version()
+    applied_stream_threshold_cells = (
+        stream_threshold_cells
+        if stream_threshold_cells is not None
+        else stream_threshold_cells_for_resolution(abs(transform.a), stream_threshold_area_m2)
+    )
     valid = valid_data_mask(elevation)
     if not valid.any():
         raise HydrologySourceError("The DEM contains no valid cells for hydrology.")
@@ -394,7 +407,10 @@ def run_hydrology(
             ) != 0:
                 raise HydrologySourceError("WhiteboxTools d8_flow_accumulation failed.")
             if tools.extract_streams(
-                str(accumulation_path), str(streams_path), stream_threshold_cells, zero_background=True
+                str(accumulation_path),
+                str(streams_path),
+                applied_stream_threshold_cells,
+                zero_background=True,
             ) != 0:
                 raise HydrologySourceError("WhiteboxTools extract_streams failed.")
             if tools.raster_streams_to_vector(
@@ -525,7 +541,8 @@ def run_hydrology(
         )
     metrics: dict[str, float | int | str | bool | None] = {
         "analysis_window_pixel_area_m2": float(pixel_area),
-        "stream_threshold_cells": stream_threshold_cells,
+        "stream_threshold_cells": applied_stream_threshold_cells,
+        "stream_threshold_area_m2": stream_threshold_area_m2,
         "window_boundary_inflow_cells": inflow_cells,
         "window_boundary_inflow_max_cells": max_boundary_accumulation,
         "window_boundary_inflow_max_inward_cells": (
@@ -539,9 +556,19 @@ def run_hydrology(
         "filtered_depression_count": len(depressions),
         "ridge_segment_count": len(ridgelines),
         "valley_segment_count": len(valleys),
+        "ridge_part_count": sum(
+            len(line.geoms) if line.geom_type == "MultiLineString" else 1 for line in ridgelines
+        ),
+        "valley_part_count": sum(
+            len(line.geoms) if line.geom_type == "MultiLineString" else 1 for line in valleys
+        ),
         "drainage_line_count": len(drainage_lines),
         "catchment_count": len(catchments),
         "filtered_catchment_count": len(catchments),
+        "catchment_part_count": sum(
+            len(polygon.geoms) if polygon.geom_type == "MultiPolygon" else 1
+            for polygon in catchments
+        ),
         "depression_min_area_m2": MIN_DEPRESSION_AREA_M2,
         "depression_min_depth_m": MIN_DEPRESSION_DEPTH_M,
         "catchment_min_area_m2": MIN_CATCHMENT_AREA_M2,

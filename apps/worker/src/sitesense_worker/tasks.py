@@ -260,6 +260,7 @@ def _persist_hydrology(
     units = {
         "analysis_window_pixel_area_m2": "square_metres",
         "stream_threshold_cells": "cells",
+        "stream_threshold_area_m2": "square_metres",
         "window_boundary_inflow_cells": "cells",
         "window_boundary_inflow_max_cells": "cells",
         "contributing_acres_within_window": "acres",
@@ -354,6 +355,7 @@ def _persist_hydrology(
             line,
             {
                 "threshold_cells": hydrology.metrics["stream_threshold_cells"],
+                "threshold_area_m2": hydrology.metrics["stream_threshold_area_m2"],
                 "analysis_scope": "within analysis window",
                 "potential_water_management_review_required": True,
                 "vectorization_method": hydrology.metrics["drainage_vectorization_method"],
@@ -366,6 +368,7 @@ def _persist_hydrology(
             {
                 "analysis_scope": "within analysis window",
                 "minimum_area_m2": hydrology.metrics["catchment_min_area_m2"],
+                "part_count": len(polygon.geoms) if polygon.geom_type == "MultiPolygon" else 1,
             },
         )
     for depression in hydrology.depressions:
@@ -388,6 +391,7 @@ def _persist_hydrology(
             {
                 "requires_contractor_review": True,
                 "minimum_length_m": hydrology.metrics["ridge_valley_min_length_m"],
+                "part_count": len(line.geoms) if line.geom_type == "MultiLineString" else 1,
             },
         )
     for line in hydrology.valleys:
@@ -397,6 +401,7 @@ def _persist_hydrology(
             {
                 "requires_contractor_review": True,
                 "minimum_length_m": hydrology.metrics["ridge_valley_min_length_m"],
+                "part_count": len(line.geoms) if line.geom_type == "MultiLineString" else 1,
             },
         )
     for corridor in hydrology.corridors:
