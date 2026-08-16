@@ -1,5 +1,6 @@
 import os
 import subprocess
+from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
@@ -8,8 +9,11 @@ from geoalchemy2.shape import from_shape
 from shapely.geometry import MultiPolygon, Polygon
 from sitesense.main import app
 from sitesense.models import Base, Job, JobStage, Organization, Parcel, Project, Property
+from sitesense.routers import analysis
 from sitesense_worker.tasks import noop_analysis
 from sqlalchemy import select, text
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 def _headers() -> dict[str, str]:
@@ -25,7 +29,7 @@ def test_migration_downgrade_upgrade(database_context) -> None:
         subprocess.run(
             ["uv", "run", "alembic", "-c", "apps/api/alembic.ini", *command],
             check=True,
-            cwd="/home/ubuntu/repos/vertical-green-saas",
+            cwd=REPO_ROOT,
             env=env,
         )
 
@@ -77,7 +81,9 @@ async def test_geometry_insert_and_spatial_indexes(db_sessionmaker, database_con
 
 
 @pytest.mark.asyncio
-async def test_tenant_isolation_and_project_analysis(db_sessionmaker, seeded_ids, seed_auth) -> None:
+async def test_tenant_isolation_and_project_analysis(
+    db_sessionmaker, seeded_ids, seed_auth, monkeypatch
+) -> None:
     organization_id, _ = seeded_ids
     other_org = uuid4()
     async with db_sessionmaker() as session:
@@ -85,6 +91,7 @@ async def test_tenant_isolation_and_project_analysis(db_sessionmaker, seeded_ids
         session.add(Project(id=UUID("11111111-1111-1111-1111-111111111111"), organization_id=other_org, name="Other"))
         await session.commit()
     client = TestClient(app)
+    monkeypatch.setattr(analysis.enqueue_analysis, "delay", lambda _: None)
     assert client.get("/api/projects/11111111-1111-1111-1111-111111111111", headers=_headers()).status_code == 404
     assert client.get("/api/projects", headers={"Authorization": "Bearer wrong"}).status_code == 401
     project = client.post("/api/projects", json={"name": "Analysis project"}, headers=_headers())
