@@ -146,6 +146,21 @@ metadata. Depressions, ridgelines, valleys, catchments, and corridor
 statistics are local-window products and are not authoritative watershed
 delineations.
 
+Corridor contributing acreage is calculated independently for each extracted
+drainage corridor from the maximum accumulation cells along that corridor.
+Parcel intersection is reported as corridor length inside the parcel, in
+contractor-facing feet with the metric length retained in layer metadata.
+Mapped-water relationships are classified against 3DHP flowlines and
+waterbodies within a 30-meter tolerance; an unavailable 3DHP query is reported
+as unavailable rather than as an absence of mapped hydrography. Whitebox
+stream vectorization is read from its Shapefile output when present. The
+fallback traces active raster cells through their centers, avoiding the
+doubled outlines produced by polygon-mask boundaries.
+
+The actual warmed WhiteboxTools executable version is recorded with each
+hydrology raster layer, independently of the Python wrapper version, so
+algorithm provenance remains traceable.
+
 Contributing acreage is always labeled `within analysis window`. Boundary
 inflow is detected from accumulation values at the analysis-window edge. When
 significant inflow is present, the value is a lower bound and the payload

@@ -10,16 +10,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, cast
 
+import geopandas as gpd
 import httpx
 import numpy as np
 import rasterio
-from rasterio.features import shapes
+from rasterio.features import geometry_mask, shapes
 from rasterio.transform import Affine
 from shapely.geometry import LineString, MultiLineString, Polygon, shape
-from shapely.ops import unary_union
+from shapely.ops import linemerge, unary_union
 
 ACRE_SQUARE_METERS = 4046.8564224
-DEFAULT_STREAM_THRESHOLD_CELLS = 100
+DEFAULT_STREAM_THRESHOLD_CELLS = 20
 DEFAULT_WINDOW_INFLOW_THRESHOLD_CELLS = 100
 HYDROGRAPHY_URL = (
     "https://3dhp.nationalmap.gov/arcgis/rest/services/usgs_3dhp_all/FeatureServer"
@@ -45,7 +46,7 @@ class JsonClient(Protocol):
 class HydroCorridor:
     geometry: LineString | MultiLineString
     contributing_acres: float
-    parcel_acres_intersected: float
+    parcel_length_m: float
     flow_direction_degrees: float | None
     mapped_water_relationship: str
 
@@ -147,6 +148,77 @@ def _line_direction_degrees(line: LineString | MultiLineString) -> float | None:
     return float((math.degrees(math.atan2(x2 - x1, y2 - y1)) + 360.0) % 360.0)
 
 
+def whitebox_binary_version() -> str:
+    """Return the warmed WhiteboxTools version without downloading anything."""
+    whitebox_binary_path()
+    from whitebox import WhiteboxTools
+
+    return str(WhiteboxTools().version()).splitlines()[0]
+
+
+def _raster_mask_to_lines(
+    values: np.ndarray,
+    transform: Affine,
+) -> list[LineString | MultiLineString]:
+    """Trace active raster cells through their centers as a line network."""
+    active = values > 0
+    rows, cols = np.where(active)
+    segments: list[LineString] = []
+    for row, col in zip(rows.tolist(), cols.tolist(), strict=True):
+        x1, y1 = transform * (col + 0.5, row + 0.5)
+        if col + 1 < active.shape[1] and active[row, col + 1]:
+            x2, y2 = transform * (col + 1.5, row + 0.5)
+            segments.append(LineString([(x1, y1), (x2, y2)]))
+        if row + 1 < active.shape[0] and active[row + 1, col]:
+            x2, y2 = transform * (col + 0.5, row + 1.5)
+            segments.append(LineString([(x1, y1), (x2, y2)]))
+    if not segments:
+        return []
+    return _line_parts(linemerge(unary_union(segments)))
+
+
+def _corridor_contributing_acres(
+    line: LineString | MultiLineString,
+    flow_accumulation: np.ndarray,
+    transform: Affine,
+    pixel_area: float,
+) -> float:
+    pixel = max(abs(transform.a), abs(transform.e)) / 2
+    mask = geometry_mask(
+        [line.buffer(pixel)],
+        out_shape=flow_accumulation.shape,
+        transform=transform,
+        invert=True,
+    )
+    values = flow_accumulation[mask & np.isfinite(flow_accumulation)]
+    if not values.size:
+        return 0.0
+    return float(np.max(values) * pixel_area / ACRE_SQUARE_METERS)
+
+
+def assign_mapped_water_relationships(
+    result: HydrologyResult,
+    mapped_geometries: list[Any] | None,
+    *,
+    tolerance_m: float = 30.0,
+) -> None:
+    """Annotate corridors against projected 3DHP flowline/waterbody geometry."""
+    if mapped_geometries is None:
+        for corridor in result.corridors:
+            corridor.mapped_water_relationship = "3DHP hydrography unavailable"
+    else:
+        for corridor in result.corridors:
+            corridor.mapped_water_relationship = (
+                "near mapped 3DHP flowline/waterbody"
+                if any(
+                    corridor.geometry.distance(geometry) <= tolerance_m
+                    for geometry in mapped_geometries
+                )
+                else "no mapped 3DHP hydrography nearby"
+            )
+    result.metrics["mapped_water_tolerance_m"] = tolerance_m
+
+
 def _dissolve_polygons(polygons: list[Polygon]) -> list[Polygon]:
     if not polygons:
         return []
@@ -162,6 +234,13 @@ def _read_vector_lines(path: Path) -> list[LineString | MultiLineString]:
     if not path.exists():
         return []
     try:
+        if path.suffix.lower() == ".shp":
+            return [
+                geometry
+                for geometry in gpd.read_file(path).geometry
+                if geometry is not None
+                and geometry.geom_type in {"LineString", "MultiLineString"}
+            ]
         payload = json.loads(path.read_text())
         features = payload.get("features", [])
         return [
@@ -184,11 +263,12 @@ def run_hydrology(
     inflow_threshold_cells: int = DEFAULT_WINDOW_INFLOW_THRESHOLD_CELLS,
 ) -> HydrologyResult:
     """Run the complete local routing workflow in a cleaned per-job directory."""
-    whitebox_binary_path()
+    binary_version = whitebox_binary_version()
     if not np.isfinite(elevation).any():
         raise HydrologySourceError("The DEM contains no valid cells for hydrology.")
     valid = np.isfinite(elevation) & (elevation > -1e30)
     nodata = -9999.0
+    vectorization_method = "raster-cell-centerline"
     with tempfile.TemporaryDirectory(prefix="sitesense-hydrology-") as directory:
         root = Path(directory)
         dem = root / "dem.tif"
@@ -196,7 +276,7 @@ def run_hydrology(
         pointer_path = root / "flow_direction.tif"
         accumulation_path = root / "flow_accumulation.tif"
         streams_path = root / "streams.tif"
-        streams_vector_path = root / "drainage_lines.geojson"
+        streams_vector_path = root / "drainage_lines.shp"
         subbasins_path = root / "catchments.tif"
         sinks_path = root / "depressions.tif"
         ridges_path = root / "ridgelines.tif"
@@ -207,8 +287,8 @@ def run_hydrology(
 
             tools = WhiteboxTools()
             tools.set_verbose_mode(False)
-            if tools.fill_depressions(str(dem), str(conditioned_path)) != 0:
-                raise HydrologySourceError("WhiteboxTools fill_depressions failed.")
+            if tools.fill_depressions_wang_and_liu(str(dem), str(conditioned_path)) != 0:
+                raise HydrologySourceError("WhiteboxTools fill_depressions_wang_and_liu failed.")
             if tools.d8_pointer(str(conditioned_path), str(pointer_path)) != 0:
                 raise HydrologySourceError("WhiteboxTools d8_pointer failed.")
             if tools.d8_flow_accumulation(str(pointer_path), str(accumulation_path)) != 0:
@@ -217,13 +297,18 @@ def run_hydrology(
                 str(accumulation_path), str(streams_path), stream_threshold_cells, zero_background=True
             ) != 0:
                 raise HydrologySourceError("WhiteboxTools extract_streams failed.")
-            tools.raster_streams_to_vector(
+            if tools.raster_streams_to_vector(
                 str(streams_path), str(pointer_path), str(streams_vector_path)
-            )
-            tools.subbasins(str(pointer_path), str(streams_path), str(subbasins_path))
-            tools.sink(str(dem), str(sinks_path), zero_background=True)
-            tools.find_ridges(str(conditioned_path), str(ridges_path))
-            tools.extract_valleys(str(conditioned_path), str(valleys_path))
+            ) != 0:
+                raise HydrologySourceError("WhiteboxTools raster_streams_to_vector failed.")
+            if tools.subbasins(str(pointer_path), str(streams_path), str(subbasins_path)) != 0:
+                raise HydrologySourceError("WhiteboxTools subbasins failed.")
+            if tools.sink(str(dem), str(sinks_path), zero_background=True) != 0:
+                raise HydrologySourceError("WhiteboxTools sink failed.")
+            if tools.find_ridges(str(conditioned_path), str(ridges_path)) != 0:
+                raise HydrologySourceError("WhiteboxTools find_ridges failed.")
+            if tools.extract_valleys(str(conditioned_path), str(valleys_path)) != 0:
+                raise HydrologySourceError("WhiteboxTools extract_valleys failed.")
         except WhiteboxBinaryError:
             raise
         except HydrologySourceError:
@@ -239,14 +324,13 @@ def run_hydrology(
         ridges = _read_raster(ridges_path)
         valley_raster = _read_raster(valleys_path)
         drainage_lines = _read_vector_lines(streams_vector_path)
+        if drainage_lines:
+            vectorization_method = "whitebox-raster-streams-to-vector"
 
     pixel_area = abs(transform.a * transform.e)
     stream_mask = streams > 0
     if not drainage_lines:
-        stream_polygons = _vectorize_mask(streams, transform, lambda values: values > 0)
-        drainage_lines = [
-            part for polygon in stream_polygons for part in _line_parts(polygon.boundary)
-        ]
+        drainage_lines = _raster_mask_to_lines(streams, transform)
     boundary = np.zeros(stream_mask.shape, dtype=bool)
     boundary[0, :] = boundary[-1, :] = True
     boundary[:, 0] = boundary[:, -1] = True
@@ -277,29 +361,26 @@ def run_hydrology(
     raw_depressions = _vectorize_mask(sinks, transform, lambda values: values > 0)
     raw_ridgeline_masks = _vectorize_mask(ridges, transform, lambda values: values > 0)
     raw_valley_masks = _vectorize_mask(valley_raster, transform, lambda values: values > 0)
-    ridgeline_masks = _dissolve_polygons(raw_ridgeline_masks)
-    valley_masks = _dissolve_polygons(raw_valley_masks)
     catchments = _dissolve_polygons(raw_catchments)
     depressions = _dissolve_polygons(raw_depressions)
-    ridgelines: list[LineString | MultiLineString] = [
-        part for polygon in ridgeline_masks for part in _line_parts(polygon.boundary)
-    ]
-    valleys: list[LineString | MultiLineString] = [
-        part for polygon in valley_masks for part in _line_parts(polygon.boundary)
-    ]
+    ridgelines = _raster_mask_to_lines(ridges, transform)
+    valleys = _raster_mask_to_lines(valley_raster, transform)
     corridors: list[HydroCorridor] = []
     for line in drainage_lines:
         parcel_intersection = line.intersection(parcel_geometry)
-        intersection_area = (
-            float(parcel_intersection.area) if not parcel_intersection.is_empty else 0.0
-        )
         corridors.append(
             HydroCorridor(
                 geometry=line,
-                contributing_acres=local_contributing_acres,
-                parcel_acres_intersected=intersection_area / ACRE_SQUARE_METERS,
+                contributing_acres=_corridor_contributing_acres(
+                    line, flow_accumulation, transform, pixel_area
+                ),
+                parcel_length_m=(
+                    float(parcel_intersection.length)
+                    if not parcel_intersection.is_empty
+                    else 0.0
+                ),
                 flow_direction_degrees=_line_direction_degrees(line),
-                mapped_water_relationship="reference hydrography queried separately",
+                mapped_water_relationship="3DHP hydrography unavailable",
             )
         )
     metrics: dict[str, float | int | str | bool | None] = {
@@ -318,6 +399,8 @@ def run_hydrology(
         "catchment_count": len(catchments),
         "parcel_acres": parcel_acres,
         "potential_water_management_review_required": True,
+        "whitebox_binary_version": binary_version,
+        "drainage_vectorization_method": vectorization_method,
     }
     return HydrologyResult(
         conditioned=conditioned,

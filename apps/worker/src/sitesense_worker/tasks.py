@@ -15,12 +15,13 @@ from geoalchemy2.elements import WKBElement
 from geoalchemy2.shape import from_shape, to_shape
 from pyproj import Transformer
 from rasterio.shutil import copy as copy_raster
-from shapely.ops import transform
+from shapely.ops import transform, unary_union
 from sitesense.config import get_settings
 from sitesense.hydrology import (
     HYDROGRAPHY_URL,
     WBD_URL,
     HydrologySourceError,
+    assign_mapped_water_relationships,
     feature_geometries,
     fetch_3dhp,
     fetch_wbd_membership,
@@ -232,6 +233,10 @@ def _persist_hydrology(
         "hydrology_flow_direction": hydrology.flow_direction,
         "hydrology_flow_accumulation": hydrology.flow_accumulation,
     }
+    source_rows = list(
+        session.scalars(select(DataSource).where(DataSource.source_url.in_(contributors)))
+    )
+    pending_layers: list[AnalysisLayer] = []
     for layer_name, array in raster_outputs.items():
         key = f"{object_prefix}/{layer_name}.tif"
         output = np.where(np.isfinite(array), array, -9999.0)
@@ -249,30 +254,22 @@ def _persist_hydrology(
                 "analysis_window_buffer_m": analysis_buffer_meters,
                 "analysis_scope": "within analysis window",
                 "source_urls": list(contributors),
+                "whitebox_binary_version": hydrology.metrics["whitebox_binary_version"],
             },
         )
-        session.add(layer)
-        session.flush()
-        for source in session.scalars(
-            select(DataSource).where(DataSource.source_url.in_(contributors))
-        ):
-            _source_ref(session, job.organization_id, source, "analysis_layers", layer.id)
+        pending_layers.append(layer)
 
     def add_geometry_layer(category_name: str, geometry: Any, metadata: dict[str, object]) -> None:
         projected = transform(inverse.transform, geometry)
-        layer = AnalysisLayer(
+        pending_layers.append(
+            AnalysisLayer(
             organization_id=job.organization_id,
             analysis_id=analysis.id,
             category=category_name,
             geometry=from_shape(projected, srid=4326),
             layer_metadata=metadata,
+            )
         )
-        session.add(layer)
-        session.flush()
-        for source in session.scalars(
-            select(DataSource).where(DataSource.source_url.in_(contributors))
-        ):
-            _source_ref(session, job.organization_id, source, "analysis_layers", layer.id)
 
     for line in hydrology.drainage_lines:
         add_geometry_layer(
@@ -282,18 +279,19 @@ def _persist_hydrology(
                 "threshold_cells": hydrology.metrics["stream_threshold_cells"],
                 "analysis_scope": "within analysis window",
                 "potential_water_management_review_required": True,
+                "vectorization_method": hydrology.metrics["drainage_vectorization_method"],
             },
         )
-    for polygon in hydrology.catchments:
+    if hydrology.catchments:
         add_geometry_layer(
             "hydrology_local_catchments",
-            polygon,
+            unary_union(hydrology.catchments),
             {"analysis_scope": "within analysis window"},
         )
-    for polygon in hydrology.depressions:
+    if hydrology.depressions:
         add_geometry_layer(
             "hydrology_local_depressions",
-            polygon,
+            unary_union(hydrology.depressions),
             {
                 "label": "potential water-management investigation area",
                 "requires_contractor_review": True,
@@ -317,14 +315,21 @@ def _persist_hydrology(
             corridor.geometry,
             {
                 "contributing_acres_within_window": corridor.contributing_acres,
-                "parcel_acres_intersected": corridor.parcel_acres_intersected,
+                "parcel_length_ft": corridor.parcel_length_m * 3.280839895,
+                "parcel_length_m": corridor.parcel_length_m,
                 "flow_direction_degrees": corridor.flow_direction_degrees,
                 "mapped_water_relationship": corridor.mapped_water_relationship,
+                "mapped_water_tolerance_m": hydrology.metrics["mapped_water_tolerance_m"],
                 "contributing_acres_is_lower_bound": bool(
                     hydrology.metrics["contributing_acres_is_lower_bound"]
                 ),
             },
         )
+    session.add_all(pending_layers)
+    session.flush()
+    for layer in pending_layers:
+        for source in source_rows:
+            _source_ref(session, job.organization_id, source, "analysis_layers", layer.id)
     return list(hydrology.warnings)
 
 
@@ -334,8 +339,9 @@ def _persist_reference_layers(
     analysis: SiteAnalysis,
     bbox: tuple[float, float, float, float],
     centroid: tuple[float, float],
-) -> list[dict[str, object]]:
+) -> tuple[list[dict[str, object]], list[Any] | None]:
     warnings: list[dict[str, object]] = []
+    mapped_geometries: list[Any] | None = None
     try:
         features = fetch_3dhp(bbox)
         hydro_source = _reference_source_row(
@@ -347,8 +353,18 @@ def _persist_reference_layers(
             access_method="arcgis-feature-service",
             notes="JSON-queryable reference hydrography; Catchment may be unavailable locally.",
         )
-        categories = {20: "hydro_3dhp_hydrolocations", 30: "hydro_3dhp_hydrolocations", 40: "hydro_3dhp_hydrolocations", 50: "hydro_3dhp_flowlines", 60: "hydro_3dhp_waterbodies", 80: "hydro_3dhp_catchments"}
+        categories = {
+            20: "hydro_3dhp_hydrolocations",
+            30: "hydro_3dhp_hydrolocations",
+            40: "hydro_3dhp_hydrolocations",
+            50: "hydro_3dhp_flowlines",
+            60: "hydro_3dhp_waterbodies",
+            80: "hydro_3dhp_catchments",
+        }
+        pending_layers: list[AnalysisLayer] = []
         for layer_id, layer_features in features.items():
+            if layer_id in (50, 60):
+                mapped_geometries = (mapped_geometries or []) + feature_geometries(layer_features)
             for feature in layer_features:
                 geometries = feature_geometries([feature])
                 if not geometries:
@@ -364,9 +380,11 @@ def _persist_reference_layers(
                         "reference_only": True,
                     },
                 )
-                session.add(layer)
-                session.flush()
-                _source_ref(session, job.organization_id, hydro_source, "analysis_layers", layer.id)
+                pending_layers.append(layer)
+        session.add_all(pending_layers)
+        session.flush()
+        for layer in pending_layers:
+            _source_ref(session, job.organization_id, hydro_source, "analysis_layers", layer.id)
         if not features.get(80):
             warnings.append(
                 {
@@ -398,7 +416,7 @@ def _persist_reference_layers(
         _source_ref(session, job.organization_id, wbd_source, "analysis_layers", layer.id)
     except HydrologySourceError as exc:
         warnings.append({"code": "hydro_wbd_unavailable", "message": str(exc)})
-    return warnings
+    return warnings, mapped_geometries
 
 
 def _set_job(session: Session, job: Job, stage: JobStage, statuses: dict[str, str], detail: str | None = None) -> None:
@@ -655,6 +673,20 @@ def _terrain_analysis(session: Session, job: Job) -> None:
                 for product in expanded_selection.products:
                     if product.source_url not in [source.source_url for source in sources]:
                         sources.append(_source_row(session, product))
+        reference_warnings, mapped_geometries = _persist_reference_layers(
+            session,
+            job,
+            analysis,
+            buffered_bounds,
+            (float(source_geometry.centroid.x), float(source_geometry.centroid.y)),
+        )
+        hydrology_warnings.extend(reference_warnings)
+        projected_mapped_geometries = (
+            None
+            if mapped_geometries is None
+            else [transform(projector.transform, geometry) for geometry in mapped_geometries]
+        )
+        assign_mapped_water_relationships(hydrology_result, projected_mapped_geometries)
         hydrology_warnings.extend(
             _persist_hydrology(
                 session,
@@ -667,15 +699,6 @@ def _terrain_analysis(session: Session, job: Job) -> None:
                 contributors,
                 buffered_projected,
                 hydrology_buffer_meters,
-            )
-        )
-        hydrology_warnings.extend(
-            _persist_reference_layers(
-                session,
-                job,
-                analysis,
-                buffered_bounds,
-                (float(source_geometry.centroid.x), float(source_geometry.centroid.y)),
             )
         )
     except HydrologySourceError as exc:
