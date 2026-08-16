@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+import httpx
 import numpy as np
 import pytest
 from rasterio.transform import from_origin
@@ -14,6 +15,7 @@ from sitesense.terrain import (
     TerrainProduct,
     TerrainSelection,
     analyze_elevation,
+    cached_products_for_bounds,
     generate_contours,
     read_mosaic,
     select_products,
@@ -38,6 +40,18 @@ class FakeClient:
     def get(self, _url: str, **kwargs: object) -> FakeResponse:
         dataset = str(kwargs["params"]["datasets"])  # type: ignore[index]
         return FakeResponse(self.responses[dataset])
+
+
+class FlakyClient(FakeClient):
+    def __init__(self, responses: dict[str, dict[str, object]]) -> None:
+        super().__init__(responses)
+        self.calls = 0
+
+    def get(self, _url: str, **kwargs: object) -> FakeResponse:
+        self.calls += 1
+        if self.calls == 1:
+            raise httpx.ReadTimeout("catalog timeout")
+        return super().get(_url, **kwargs)
 
 
 def _item(dataset: str, bounds: tuple[float, float, float, float], url: str) -> dict[str, object]:
@@ -65,6 +79,19 @@ def test_source_selection_prefers_complete_one_meter_coverage() -> None:
     assert selection.products[0].source_url == "one.tif"
 
 
+def test_source_selection_retries_transient_catalog_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = FlakyClient(
+        {
+            ONE_METER_DATASET: {"items": [_item(ONE_METER_DATASET, (0, 0, 10, 10), "one.tif")]},
+            THIRD_ARC_SECOND_DATASET: {"items": []},
+        }
+    )
+    monkeypatch.setattr("sitesense.terrain.time.sleep", lambda _seconds: None)
+    selection = select_products((1, 1, 9, 9), client)
+    assert selection.products[0].source_url == "one.tif"
+    assert client.calls == 2
+
+
 def test_source_selection_falls_back_when_one_meter_is_incomplete() -> None:
     client = FakeClient(
         {
@@ -88,6 +115,28 @@ def test_source_selection_reports_empty_coverage() -> None:
     selection = select_products((1, 1, 9, 9), client)
     assert selection.products == ()
     assert selection.warning == "No 3DEP product fully covers the buffered parcel."
+
+
+def test_cached_catalog_fallback_selects_covering_product() -> None:
+    product = TerrainProduct(
+        title="cached",
+        dataset_name=ONE_METER_DATASET,
+        source_url="s3://cached.tif",
+        bounds=(0, 0, 10, 10),
+        spatial_resolution="1 m",
+        published_at=None,
+        byte_size=None,
+    )
+    selection = cached_products_for_bounds((product,), (1, 1, 9, 9))
+    assert selection.products == (product,)
+    assert selection.used_fallback is True
+    assert "cached" in (selection.warning or "")
+
+
+def test_cached_catalog_fallback_reports_no_usable_product() -> None:
+    selection = cached_products_for_bounds((), (1, 1, 9, 9))
+    assert selection.products == ()
+    assert "no cached" in (selection.warning or "").lower()
 
 
 def test_known_gradient_has_analytic_slope_and_aspect() -> None:

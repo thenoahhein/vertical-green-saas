@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Protocol, cast
@@ -17,6 +18,7 @@ from rasterio.features import geometry_mask
 from rasterio.transform import Affine, from_origin
 from rasterio.warp import reproject, transform_bounds
 from shapely.geometry import LineString, MultiLineString, box, mapping
+from shapely.ops import unary_union
 
 matplotlib_use("Agg")
 
@@ -53,6 +55,26 @@ class TerrainSelection:
     products: tuple[TerrainProduct, ...]
     used_fallback: bool
     warning: str | None = None
+
+
+def cached_products_for_bounds(
+    products: tuple[TerrainProduct, ...],
+    bbox: tuple[float, float, float, float],
+) -> TerrainSelection:
+    requested = box(*bbox)
+    candidates = tuple(product for product in products if box(*product.bounds).intersects(requested))
+    coverage = unary_union([box(*product.bounds) for product in candidates]) if candidates else None
+    if coverage is None or not coverage.covers(requested):
+        return TerrainSelection(
+            (),
+            True,
+            "terrain_source_unavailable: TNMAccess catalog was unavailable and no cached 3DEP product covers the buffered parcel.",
+        )
+    return TerrainSelection(
+        candidates,
+        True,
+        "terrain_catalog_unavailable_cached_product: TNMAccess catalog was unavailable; used a cached 3DEP product record.",
+    )
 
 
 @dataclass
@@ -132,6 +154,25 @@ def _query_products(
     ]
 
 
+def _query_products_with_retry(
+    bbox: tuple[float, float, float, float],
+    dataset_name: str,
+    client: ProductClient,
+    *,
+    attempts: int = 3,
+) -> list[TerrainProduct]:
+    last_error: httpx.HTTPError | None = None
+    for attempt in range(attempts):
+        try:
+            return _query_products(bbox, dataset_name, client)
+        except httpx.HTTPError as exc:
+            last_error = exc
+            if attempt + 1 < attempts:
+                time.sleep(2**attempt)
+    assert last_error is not None
+    raise last_error
+
+
 def select_products(
     bbox: tuple[float, float, float, float],
     client: ProductClient | None = None,
@@ -141,7 +182,7 @@ def select_products(
     close_client = client is None
     try:
         try:
-            one_meter = _query_products(bbox, ONE_METER_DATASET, http_client)
+            one_meter = _query_products_with_retry(bbox, ONE_METER_DATASET, http_client)
         except httpx.HTTPError as exc:
             raise TerrainSourceError(f"TNMAccess 1-meter query failed: {exc}") from exc
         requested = box(*bbox)
@@ -153,7 +194,7 @@ def select_products(
         if one_meter and coverage.covers(requested):
             return TerrainSelection(tuple(one_meter), False)
         try:
-            fallback = _query_products(bbox, THIRD_ARC_SECOND_DATASET, http_client)
+            fallback = _query_products_with_retry(bbox, THIRD_ARC_SECOND_DATASET, http_client)
         except httpx.HTTPError as exc:
             raise TerrainSourceError(f"TNMAccess fallback query failed: {exc}") from exc
         if fallback:
