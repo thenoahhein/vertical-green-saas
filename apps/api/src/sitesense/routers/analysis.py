@@ -8,7 +8,15 @@ from sitesense_worker.tasks import enqueue_analysis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from sitesense.models import AnalysisCategory, AnalysisLayer, Job, JobStage, Project, SiteAnalysis
+from sitesense.models import (
+    AnalysisCategory,
+    AnalysisLayer,
+    DerivedMetric,
+    Job,
+    JobStage,
+    Project,
+    SiteAnalysis,
+)
 from sitesense.schemas import AnalysisLayerRead, AnalysisRead, AnalyzeResponse, JobRead
 from sitesense.tenant import CurrentOrg, current_org, get_db, scoped_get
 
@@ -62,24 +70,53 @@ async def analysis(project_id: UUID, db: AsyncSession = Depends(get_db), org: Cu
         .order_by(AnalysisCategory.created_at.desc())
         .limit(1)
     )
-    terrain_layer = await db.scalar(
-        select(AnalysisLayer)
+    metric_result = await db.execute(
+        select(DerivedMetric)
         .where(
-            AnalysisLayer.analysis_id == analysis_row.id,
-            AnalysisLayer.category == "terrain_dem",
-            AnalysisLayer.organization_id == org.organization_id,
+            DerivedMetric.analysis_id == analysis_row.id,
+            DerivedMetric.category == "terrain",
+            DerivedMetric.organization_id == org.organization_id,
         )
-        .order_by(AnalysisLayer.created_at.desc())
-        .limit(1)
     )
-    terrain = terrain_layer.layer_metadata.get("metrics") if terrain_layer else None
-    warning = terrain_layer.layer_metadata.get("warning") if terrain_layer else None
+    terrain_payload: dict[str, object] = {}
+    histogram: dict[str, dict[str, object]] = {}
+    for metric in metric_result.scalars():
+        if metric.value is None:
+            continue
+        if metric.name.startswith("slope_bucket:"):
+            _, bucket, suffix = metric.name.split(":", 2)
+            histogram.setdefault(bucket, {"bucket": bucket})[suffix] = metric.value
+        else:
+            terrain_payload[metric.name] = metric.value
+    if histogram:
+        for bucket_payload in histogram.values():
+            bucket_payload["percentage_denominator"] = "valid slope pixels"
+        terrain_payload["slope_histogram"] = list(histogram.values())
+    coverage = terrain_payload.get("coverage_fraction")
+    warnings: list[dict[str, object]] = []
+    if isinstance(coverage, (int, float)) and coverage == 0:
+        warnings.append(
+            {
+                "code": "terrain_source_unavailable",
+                "message": "3DEP elevation coverage is unavailable for this parcel.",
+                "missing_fraction": 1.0,
+            }
+        )
+    elif isinstance(coverage, (int, float)) and coverage < 0.99:
+        missing_fraction = 1 - coverage
+        warnings.append(
+            {
+                "code": "terrain_coverage_incomplete",
+                "message": f"3DEP elevation coverage is incomplete; {missing_fraction:.1%} of the parcel is missing.",
+                "missing_fraction": missing_fraction,
+            }
+        )
     return AnalysisRead(
         status=category.status.value if category else "unavailable",
         confidence=category.confidence.value if category and category.confidence else "low",
         confidence_reason=category.confidence_reason if category else "Terrain analysis unavailable.",
-        terrain=terrain if isinstance(terrain, dict) else None,
-        warnings=[warning] if isinstance(warning, dict) else [],
+        terrain=terrain_payload or None,
+        warnings=warnings,
     )
 
 

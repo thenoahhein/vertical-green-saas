@@ -27,6 +27,10 @@ THIRD_ARC_SECOND_DATASET = "National Elevation Dataset (NED) 1/3 arc-second"
 NODATA = -3.4028230607370965e38
 
 
+class TerrainSourceError(RuntimeError):
+    """An upstream DEM catalog or raster source could not be read."""
+
+
 class ProductClient(Protocol):
     def get(self, url: str, **kwargs: Any) -> httpx.Response: ...
 
@@ -136,7 +140,10 @@ def select_products(
     http_client: ProductClient = cast(ProductClient, client or httpx.Client(timeout=30.0))
     close_client = client is None
     try:
-        one_meter = _query_products(bbox, ONE_METER_DATASET, http_client)
+        try:
+            one_meter = _query_products(bbox, ONE_METER_DATASET, http_client)
+        except httpx.HTTPError as exc:
+            raise TerrainSourceError(f"TNMAccess 1-meter query failed: {exc}") from exc
         requested = box(*bbox)
         coverage = box(*bbox)
         if one_meter:
@@ -145,7 +152,10 @@ def select_products(
                 coverage = coverage.union(box(*product.bounds))
         if one_meter and coverage.covers(requested):
             return TerrainSelection(tuple(one_meter), False)
-        fallback = _query_products(bbox, THIRD_ARC_SECOND_DATASET, http_client)
+        try:
+            fallback = _query_products(bbox, THIRD_ARC_SECOND_DATASET, http_client)
+        except httpx.HTTPError as exc:
+            raise TerrainSourceError(f"TNMAccess fallback query failed: {exc}") from exc
         if fallback:
             fallback_coverage = box(*fallback[0].bounds)
             for product in fallback[1:]:
@@ -176,7 +186,7 @@ def _target_grid(
     return from_origin(min_x, max_y, resolution, resolution), width, height
 
 
-def _source_resolution(dataset: rasterio.DatasetReader, target_crs: str) -> float:
+def _source_resolution(dataset: rasterio.DatasetReader) -> float:
     if dataset.crs and dataset.crs.is_projected:
         return float(abs(cast(float, dataset.res[0])))
     lonlat_width = abs(cast(float, dataset.res[0])) * 111_320.0
@@ -187,42 +197,58 @@ def read_mosaic(
     products: tuple[TerrainProduct, ...],
     target_bounds_wgs84: tuple[float, float, float, float],
     target_crs: str,
-) -> tuple[np.ndarray, Affine, str]:
+) -> tuple[np.ndarray, Affine, str, tuple[str, ...]]:
     """Window-read product COGs and mosaic them on one nodata-aware grid."""
     if not products:
         raise ValueError("No terrain products available")
     target_bounds = transform_bounds("EPSG:4326", target_crs, *target_bounds_wgs84)
-    with rasterio.open(products[0].source_url) as first:
-        resolution = _source_resolution(first, target_crs)
+    ordered_products = sorted(
+        products,
+        key=lambda product: product.published_at.timestamp() if product.published_at else float("-inf"),
+        reverse=True,
+    )
+    try:
+        with rasterio.open(ordered_products[0].source_url) as first:
+            resolution = _source_resolution(first)
+    except (rasterio.errors.RasterioError, OSError) as exc:
+        raise TerrainSourceError(f"3DEP raster read failed: {exc}") from exc
     target_transform, width, height = _target_grid(target_bounds, resolution)
     destination = np.full((height, width), NODATA, dtype="float32")
-    for product in products:
-        with rasterio.open(product.source_url) as source:
-            source_bounds = transform_bounds(
-                target_crs, source.crs, *target_bounds, densify_pts=21
-            )
-            window = rasterio.windows.from_bounds(*source_bounds, transform=source.transform)
-            window = window.round_offsets().round_lengths()
-            window = window.intersection(rasterio.windows.Window(0, 0, source.width, source.height))
-            if window.width <= 0 or window.height <= 0:
-                continue
-            source_array = source.read(1, window=window, masked=False)
-            source_transform = source.window_transform(window)
-            reprojected = np.full(destination.shape, NODATA, dtype="float32")
-            reproject(
-                source_array,
-                reprojected,
-                src_transform=source_transform,
-                src_crs=source.crs,
-                src_nodata=source.nodata,
-                dst_transform=target_transform,
-                dst_crs=target_crs,
-                dst_nodata=NODATA,
-                resampling=Resampling.bilinear,
-            )
-            valid = reprojected != NODATA
-            destination[valid] = reprojected[valid]
-    return destination, target_transform, target_crs
+    filled = np.zeros(destination.shape, dtype=bool)
+    contributors: list[str] = []
+    try:
+        for product in ordered_products:
+            with rasterio.open(product.source_url) as source:
+                source_bounds = transform_bounds(
+                    target_crs, source.crs, *target_bounds, densify_pts=21
+                )
+                window = rasterio.windows.from_bounds(*source_bounds, transform=source.transform)
+                window = window.round_offsets().round_lengths()
+                window = window.intersection(rasterio.windows.Window(0, 0, source.width, source.height))
+                if window.width <= 0 or window.height <= 0:
+                    continue
+                source_array = source.read(1, window=window, masked=False)
+                source_transform = source.window_transform(window)
+                reprojected = np.full(destination.shape, NODATA, dtype="float32")
+                reproject(
+                    source_array,
+                    reprojected,
+                    src_transform=source_transform,
+                    src_crs=source.crs,
+                    src_nodata=source.nodata,
+                    dst_transform=target_transform,
+                    dst_crs=target_crs,
+                    dst_nodata=NODATA,
+                    resampling=Resampling.bilinear,
+                )
+                valid = (reprojected != NODATA) & ~filled
+                if valid.any():
+                    destination[valid] = reprojected[valid]
+                    filled[valid] = True
+                    contributors.append(product.source_url)
+    except (rasterio.errors.RasterioError, OSError) as exc:
+        raise TerrainSourceError(f"3DEP raster read failed: {exc}") from exc
+    return destination, target_transform, target_crs, tuple(contributors)
 
 
 def _focal_mean(values: np.ndarray, valid: np.ndarray) -> np.ndarray:
@@ -292,6 +318,7 @@ def _metric_values(
                 "bucket": label,
                 "acres": acres,
                 "percentage": float(selected.sum() / len(slope_values) * 100),
+                "percentage_denominator": "valid slope pixels",
             }
         )
     values_m = elevation_values.astype("float64")
@@ -347,15 +374,26 @@ def generate_contours(
                 clipped = LineString(segment).intersection(clip_geometry)
                 if clipped.is_empty:
                     continue
-                pieces.append(clipped)
+                pieces.extend(_line_parts(clipped))
             if pieces:
-                geometry = pieces[0] if len(pieces) == 1 else MultiLineString(
-                    [piece for piece in pieces if piece.geom_type == "LineString"]
-                )
-                results.append((float(level), round(float(level / interval_m)) % 5 == 0, geometry))
+                geometry = pieces[0] if len(pieces) == 1 else MultiLineString(pieces)
+                level_feet = float(level * 3.280839895)
+                is_index = math.isclose(level_feet / 10, round(level_feet / 10), abs_tol=1e-6)
+                results.append((float(level), is_index, geometry))
         return results
     finally:
         plt.close(figure)
+
+
+def _line_parts(geometry: Any) -> list[LineString]:
+    if geometry.geom_type == "LineString":
+        return [geometry]
+    if hasattr(geometry, "geoms"):
+        parts: list[LineString] = []
+        for part in geometry.geoms:
+            parts.extend(_line_parts(part))
+        return parts
+    return []
 
 
 def analyze_elevation(
@@ -389,7 +427,7 @@ def analyze_elevation(
     slope_degrees = np.degrees(np.arctan(np.hypot(raw_dzdx, raw_dzdy)))
     stats_slope_percent = np.hypot(stats_dzdx, stats_dzdy) * 100
     stats_slope_degrees = np.degrees(np.arctan(np.hypot(stats_dzdx, stats_dzdy)))
-    aspect = (np.degrees(np.arctan2(raw_dzdx, -raw_dzdy)) + 360) % 360
+    aspect = (np.degrees(np.arctan2(-raw_dzdx, raw_dzdy)) + 360) % 360
     slope_radians = np.arctan(np.hypot(raw_dzdx, raw_dzdy))
     azimuth = np.radians(315)
     altitude = np.radians(45)

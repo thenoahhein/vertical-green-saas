@@ -108,10 +108,12 @@ Derivatives run on a projected metre grid after all intersecting COG windows
 have been mosaicked. NumPy implements Horn 3x3 slope, aspect, and hillshade
 derivatives. Raw elevation remains the raster basis, while reported slope
 statistics use a 3x3 focal-mean-smoothed elevation surface to produce a
-planning-grade contractor metric. Elevations are stored in metres and payloads
-also expose contractor-facing feet values. Contours use matplotlib, a 2-foot
+planning-grade contractor metric. The slope histogram reports acreage from
+parcel pixels and percentages of valid parcel slope pixels; the payload names
+that denominator explicitly. Elevations are stored in metres and payloads also
+expose contractor-facing feet values. Contours use matplotlib, a 2-foot
 interval at 1-meter source resolution (5 feet otherwise), and are stored as
-4326 geometries with 10-foot index metadata.
+per-level 4326 geometries with elevation-in-feet and 10-foot index metadata.
 
 Terrain rasters are written as COGs to the S3-compatible object store under
 organization/project/analysis-scoped keys. Coverage below 99 percent produces

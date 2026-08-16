@@ -34,6 +34,7 @@ from sitesense.models import (
 )
 from sitesense.terrain import (
     DEFAULT_TERRAIN_BUFFER_METERS,
+    TerrainSourceError,
     analyze_elevation,
     read_mosaic,
     select_products,
@@ -168,13 +169,24 @@ def _terrain_analysis(session: Session, job: Job) -> None:
                 confidence_reason=selection.warning or "No 3DEP product covered the buffered parcel.",
             )
         )
+        session.add(
+            DerivedMetric(
+                organization_id=job.organization_id,
+                analysis_id=analysis.id,
+                category="terrain",
+                name="coverage_fraction",
+                value=0.0,
+                unit="fraction",
+            )
+        )
         _set_job(session, job, JobStage.partial, {"terrain": "unavailable"}, selection.warning)
         return
-    elevation, grid_transform, grid_crs = read_mosaic(
+    elevation, grid_transform, grid_crs, contributors = read_mosaic(
         selection.products,
         buffered_bounds,
         "EPSG:26914",
     )
+    contributor_sources = [source for source in sources if source.source_url in contributors]
     _set_job(session, job, JobStage.processing, {"terrain": "processing"})
     result = analyze_elevation(
         elevation,
@@ -192,20 +204,19 @@ def _terrain_analysis(session: Session, job: Job) -> None:
     )
     session.add(analysis)
     session.flush()
-    session.add(
-        AnalysisCategory(
-            organization_id=job.organization_id,
-            analysis_id=analysis.id,
-            category="terrain",
-            status=CategoryStatus.complete,
-            confidence=Confidence.high if result.coverage_fraction >= 0.99 else Confidence.medium,
-            confidence_reason=(
-                "1 m 3DEP coverage and 3x3 focal-mean-smoothed planning-grade slope statistics."
-                if not selection.used_fallback
-                else "1/3 arc-second fallback coverage and planning-grade slope statistics."
-            ),
-        )
+    category = AnalysisCategory(
+        organization_id=job.organization_id,
+        analysis_id=analysis.id,
+        category="terrain",
+        status=CategoryStatus.complete,
+        confidence=Confidence.high if result.coverage_fraction >= 0.99 else Confidence.medium,
+        confidence_reason=(
+            "1 m 3DEP coverage and 3x3 focal-mean-smoothed planning-grade slope statistics."
+            if not selection.used_fallback
+            else "1/3 arc-second fallback coverage and planning-grade slope statistics."
+        ),
     )
+    session.add(category)
     session.flush()
     object_prefix = f"{job.organization_id}/{job.project_id}/analysis/{analysis.id}"
     for category_name, array in {
@@ -226,14 +237,12 @@ def _terrain_analysis(session: Session, job: Job) -> None:
                 "crs": result.crs,
                 "resolution_m": abs(result.transform.a),
                 "nodata": -3.4028230607370965e38,
-                "source_urls": [product.source_url for product in selection.products],
-                "metrics": result.metrics if category_name == "terrain_dem" else {},
-                "warning": result.warning,
+                "source_urls": contributors,
             },
         )
         session.add(layer)
         session.flush()
-        for source in sources:
+        for source in contributor_sources:
             session.add(
                 AnalysisSourceRef(
                     organization_id=job.organization_id,
@@ -242,27 +251,23 @@ def _terrain_analysis(session: Session, job: Job) -> None:
                     derived_id=layer.id,
                 )
             )
-    contour_geometries = [
-        transform(inverse.transform, geometry)
-        for _, _, geometry in result.contours
-    ]
-    if contour_geometries:
-        from shapely.ops import unary_union
-
+    for elevation_m, is_index, geometry in result.contours:
         contour_layer = AnalysisLayer(
             organization_id=job.organization_id,
             analysis_id=analysis.id,
             category="terrain_contours",
-            geometry=from_shape(unary_union(contour_geometries), srid=4326),
+            geometry=from_shape(transform(inverse.transform, geometry), srid=4326),
             layer_metadata={
                 "interval_feet": 2 if abs(result.transform.a) <= 1 else 5,
                 "index_interval_feet": 10,
-                "source_urls": [product.source_url for product in selection.products],
+                "elevation_ft": elevation_m * 3.280839895,
+                "is_index": is_index,
+                "source_urls": contributors,
             },
         )
         session.add(contour_layer)
         session.flush()
-        for source in sources:
+        for source in contributor_sources:
             session.add(
                 AnalysisSourceRef(
                     organization_id=job.organization_id,
@@ -271,15 +276,26 @@ def _terrain_analysis(session: Session, job: Job) -> None:
                     derived_id=contour_layer.id,
                 )
             )
-    for name, value in (
-        ("coverage_fraction", result.coverage_fraction),
-        ("elevation_min_m", result.metrics.get("elevation_min_m")),
-        ("elevation_max_m", result.metrics.get("elevation_max_m")),
-        ("elevation_mean_m", result.metrics.get("elevation_mean_m")),
-        ("relief_m", result.metrics.get("relief_m")),
-        ("mean_slope_percent", result.metrics.get("mean_slope_percent")),
-        ("mean_slope_degrees", result.metrics.get("mean_slope_degrees")),
-    ):
+    units = {
+        "coverage_fraction": "fraction",
+        "parcel_acres": "acres",
+        "valid_acres": "acres",
+        "elevation_min_m": "metres",
+        "elevation_max_m": "metres",
+        "elevation_mean_m": "metres",
+        "elevation_min_ft": "feet",
+        "elevation_max_ft": "feet",
+        "elevation_mean_ft": "feet",
+        "relief_m": "metres",
+        "relief_ft": "feet",
+        "mean_slope_percent": "percent",
+        "mean_slope_degrees": "degrees",
+    }
+    metrics = dict(result.metrics)
+    metrics["coverage_fraction"] = result.coverage_fraction
+    for name, value in metrics.items():
+        if name == "slope_histogram" or name == "elevation_units" or name == "slope_statistics_surface":
+            continue
         if value is not None:
             session.add(
                 DerivedMetric(
@@ -288,9 +304,33 @@ def _terrain_analysis(session: Session, job: Job) -> None:
                     category="terrain",
                     name=name,
                     value=float(value),
-                    unit="fraction" if name == "coverage_fraction" else "metres",
+                    unit=units.get(name, "number"),
                 )
             )
+    for bucket in result.metrics.get("slope_histogram", []):
+        bucket_name = str(bucket["bucket"])
+        for suffix in ("acres", "percentage"):
+            session.add(
+                DerivedMetric(
+                    organization_id=job.organization_id,
+                    analysis_id=analysis.id,
+                    category="terrain",
+                    name=f"slope_bucket:{bucket_name}:{suffix}",
+                    value=float(bucket[suffix]),
+                    unit="acres" if suffix == "acres" else "percent_of_valid_slope_pixels",
+                )
+            )
+    if result.warning:
+        session.add(
+            DerivedMetric(
+                organization_id=job.organization_id,
+                analysis_id=analysis.id,
+                category="terrain",
+                name="coverage_missing_fraction",
+                value=float(result.warning["missing_fraction"]),
+                unit="fraction",
+            )
+        )
     _set_job(
         session,
         job,
@@ -310,7 +350,7 @@ def terrain_analysis(job_id: str) -> str:
             _set_job(session, job, JobStage.fetching, {"terrain": "fetching"})
             _terrain_analysis(session, job)
             session.commit()
-        except Exception as exc:
+        except TerrainSourceError as exc:
             session.rollback()
             with Session(engine) as failed_session:
                 failed_job = failed_session.get(Job, UUID(job_id))
@@ -320,9 +360,23 @@ def terrain_analysis(job_id: str) -> str:
                         failed_job,
                         JobStage.partial,
                         {"terrain": "unavailable"},
-                        f"Terrain analysis warning: {exc}",
+                        f"Terrain source unavailable: {exc}",
                     )
                     failed_session.commit()
+        except Exception:
+            session.rollback()
+            with Session(engine) as failed_session:
+                failed_job = failed_session.get(Job, UUID(job_id))
+                if failed_job is not None:
+                    _set_job(
+                        failed_session,
+                        failed_job,
+                        JobStage.failed,
+                        {"terrain": "failed"},
+                        "Terrain analysis failed.",
+                    )
+                    failed_session.commit()
+            raise
         return job_id
 
 
