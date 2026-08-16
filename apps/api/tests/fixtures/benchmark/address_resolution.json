@@ -1,0 +1,17 @@
+{
+  "description": "Interim address-resolution benchmark for PRD 39 (>=95% of addresses return the intended parcel within the first three candidates). Expected parcel ids are county CAD prop_id_text values captured from the live services; addresses were verified to resolve through the US Census geocoder. The full 40-parcel benchmark (PRD 38) is Milestone 10.",
+  "cases": [
+    {"county": "Bastrop", "address": "569 WAUGH WAY, Bastrop, TX 78602", "expected_parcel_id": "85292", "appraisal_acres": 2.512, "acreage_band": "0.5-10"},
+    {"county": "Bastrop", "address": "307 WILBARGER BEND RD, Bastrop, TX 78602", "expected_parcel_id": "34335", "appraisal_acres": 201.135, "acreage_band": "60-400"},
+    {"county": "Bastrop", "address": "1311 Chestnut St, Bastrop, TX 78602", "expected_parcel_id": "35585", "appraisal_acres": 2.546, "acreage_band": "0.5-10"},
+    {"county": "Lee", "address": "4717 CR 127 ESMT, Ledbetter, TX 78946", "expected_parcel_id": "101427", "appraisal_acres": 2.445, "acreage_band": "0.5-10"},
+    {"county": "Lee", "address": "1385 CR 208, Giddings, TX 78942", "expected_parcel_id": "10014", "appraisal_acres": 17.0, "acreage_band": "10-60"},
+    {"county": "Lee", "address": "3675 CR 114, Giddings, TX 78942", "expected_parcel_id": "10242", "appraisal_acres": 156.1, "acreage_band": "60-400"},
+    {"county": "Fayette", "address": "4664 PIN OAK BRANCH RD, La Grange, TX 78945", "expected_parcel_id": "103123", "appraisal_acres": 2.222, "acreage_band": "0.5-10"},
+    {"county": "Fayette", "address": "272 KYLESGATE LANE, La Grange, TX 78984", "expected_parcel_id": "106689", "appraisal_acres": 11.134, "acreage_band": "10-60"},
+    {"county": "Fayette", "address": "9419 OLD LOCKHART, Muldoon, TX 78949", "expected_parcel_id": "25647", "appraisal_acres": 151.769, "acreage_band": "60-400"},
+    {"county": "Caldwell", "address": "215 SADDLEBRED, Lockhart, TX 78644", "expected_parcel_id": "101106", "appraisal_acres": 1.002, "acreage_band": "0.5-10"},
+    {"county": "Caldwell", "address": "3700 LYTTON LN, Dale, TX 78616", "expected_parcel_id": "103290", "appraisal_acres": 10.197, "acreage_band": "10-60"},
+    {"county": "Caldwell", "address": "18360 FM 86, Red Rock, TX 78662", "expected_parcel_id": "10759", "appraisal_acres": 69.5, "acreage_band": "60-400"}
+  ]
+}
