@@ -49,8 +49,16 @@ async def run() -> None:
                 await asyncio.sleep(1)
             analysis = await client.get(f"/api/projects/{project_id}/analysis")
             analysis.raise_for_status()
+            layers = await client.get(f"/api/projects/{project_id}/layers")
+            layers.raise_for_status()
             terrain = analysis.json().get("terrain") or {}
             hydrology = analysis.json().get("hydrology") or {}
+            layer_rows = layers.json()
+            corridor_rows = [
+                row.get("metadata", {})
+                for row in layer_rows
+                if row.get("category") == "hydrology_corridors"
+            ]
             elapsed = time.perf_counter() - started
             missing = sorted(REQUIRED_FIELDS - terrain.keys())
             missing_hydrology = sorted(HYDROLOGY_FIELDS - hydrology.keys())
@@ -60,6 +68,8 @@ async def run() -> None:
                 f"terrain_required={not missing} missing={','.join(missing)} "
                 f"hydrology_required={not missing_hydrology} "
                 f"hydrology_truncated={hydrology.get('window_truncated')} "
+                f"corridors={len(corridor_rows)} "
+                f"parcel_lengths_ft={sum(float(row.get('parcel_length_ft', 0)) for row in corridor_rows):.1f} "
                 f"missing_hydrology={','.join(missing_hydrology)}"
             )
 

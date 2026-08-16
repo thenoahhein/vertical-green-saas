@@ -6,10 +6,12 @@ from typing import Any
 import numpy as np
 import pytest
 from rasterio.transform import from_origin
-from shapely.geometry import box
+from shapely.geometry import LineString, box
 from sitesense.hydrology import (
     HydrologySourceError,
     WhiteboxBinaryError,
+    _corridor_contributing_acres,
+    assign_mapped_water_relationships,
     fetch_3dhp,
     fetch_wbd_membership,
     run_hydrology,
@@ -93,11 +95,9 @@ def test_missing_whitebox_binary_is_typed(monkeypatch: pytest.MonkeyPatch) -> No
         )
 
 
-@pytest.mark.skipif(
-    not _whitebox_available(),
-    reason="WhiteboxTools binary is not present in this test environment",
-)
 def test_v_valley_routes_to_one_coherent_corridor() -> None:
+    if not _whitebox_available():
+        pytest.fail("CI must warm the WhiteboxTools binary before routing tests.")
     columns = np.indices((64, 64))[1]
     elevation = np.abs(columns - 32).astype("float32")
     result = run_hydrology(
@@ -111,6 +111,88 @@ def test_v_valley_routes_to_one_coherent_corridor() -> None:
     assert result.flow_accumulation[32, 0] <= result.flow_accumulation[32, -1]
     assert result.drainage_lines
     assert result.valleys
+    assert result.corridors
+    assert any(corridor.parcel_length_m > 0 for corridor in result.corridors)
+    assert result.metrics["drainage_vectorization_method"] == "whitebox-raster-streams-to-vector"
+
+
+def test_tilted_plane_routes_downhill() -> None:
+    if not _whitebox_available():
+        pytest.fail("CI must warm the WhiteboxTools binary before routing tests.")
+    rows, cols = np.indices((48, 48))
+    elevation = (rows * 0.1 + cols * 0.02).astype("float32")
+    result = run_hydrology(
+        elevation,
+        from_origin(0, 48, 1, 1),
+        "EPSG:26914",
+        box(10, 10, 38, 38),
+        1.0,
+        stream_threshold_cells=2,
+    )
+    assert np.nanmax(result.flow_accumulation[0]) > np.nanmax(result.flow_accumulation[-1])
+
+
+def test_closed_depression_is_detected_and_filled() -> None:
+    if not _whitebox_available():
+        pytest.fail("CI must warm the WhiteboxTools binary before routing tests.")
+    elevation = np.full((48, 48), 10.0, dtype="float32")
+    elevation[22:27, 22:27] = 2.0
+    result = run_hydrology(
+        elevation,
+        from_origin(0, 48, 1, 1),
+        "EPSG:26914",
+        box(10, 10, 38, 38),
+        1.0,
+        stream_threshold_cells=2,
+    )
+    assert result.depressions
+    assert float(result.conditioned[24, 24]) > float(elevation[24, 24])
+
+
+def test_two_channel_confluence_accumulates_downstream() -> None:
+    if not _whitebox_available():
+        pytest.fail("CI must warm the WhiteboxTools binary before routing tests.")
+    rows, cols = np.indices((64, 64))
+    elevation = (
+        np.minimum(np.abs(cols - 20), np.abs(cols - 44)) * 0.5 - rows * 0.1
+    ).astype("float32")
+    result = run_hydrology(
+        elevation,
+        from_origin(0, 64, 1, 1),
+        "EPSG:26914",
+        box(10, 10, 54, 54),
+        1.0,
+        stream_threshold_cells=2,
+    )
+    assert result.drainage_lines
+    assert float(result.flow_accumulation[-1].max()) > float(result.flow_accumulation[32].max())
+
+
+def test_corridor_metrics_and_mapped_water_relationships() -> None:
+    accumulation = np.zeros((8, 8), dtype="float32")
+    accumulation[:, 2] = np.arange(8)
+    accumulation[:, 5] = np.arange(8) * 2
+    transform = from_origin(0, 8, 1, 1)
+    first = LineString([(2.5, 7.5), (2.5, 0.5)])
+    second = LineString([(5.5, 7.5), (5.5, 0.5)])
+    first_acres = _corridor_contributing_acres(first, accumulation, transform, 1.0)
+    second_acres = _corridor_contributing_acres(second, accumulation, transform, 1.0)
+    assert second_acres > first_acres
+
+    result = type(
+        "Result",
+        (),
+        {
+            "corridors": [
+                type("Corridor", (), {"geometry": first, "mapped_water_relationship": ""})(),
+            ],
+            "metrics": {},
+        },
+    )()
+    assign_mapped_water_relationships(result, [LineString([(2.5, 7.5), (2.5, 0.5)])])
+    assert result.corridors[0].mapped_water_relationship == "near mapped 3DHP flowline/waterbody"
+    assign_mapped_water_relationships(result, None)
+    assert result.corridors[0].mapped_water_relationship == "3DHP hydrography unavailable"
 
 
 def test_whitebox_path_is_explicit() -> None:
