@@ -1,0 +1,35 @@
+services:
+  postgis:
+    image: postgis/postgis:16-3.4
+    environment: {POSTGRES_DB: sitesense, POSTGRES_USER: sitesense, POSTGRES_PASSWORD: sitesense}
+    ports: ["5432:5432"]
+    healthcheck: {test: ["CMD-SHELL", "pg_isready -U sitesense -d sitesense"], interval: 5s, timeout: 5s, retries: 20}
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    healthcheck: {test: ["CMD", "redis-cli", "ping"], interval: 5s, timeout: 3s, retries: 20}
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment: {MINIO_ROOT_USER: minio, MINIO_ROOT_PASSWORD: miniopassword}
+    ports: ["9000:9000", "9001:9001"]
+    healthcheck: {test: ["CMD", "mc", "ready", "local"], interval: 5s, timeout: 5s, retries: 20}
+  minio-init:
+    image: minio/mc:latest
+    depends_on: {minio: {condition: service_healthy}}
+    entrypoint: /bin/sh
+    command: -c "mc alias set local http://minio:9000 minio miniopassword && mc mb --ignore-existing local/sitesense"
+  api:
+    build: {context: .., dockerfile: apps/api/Dockerfile}
+    environment: {DATABASE_URL: postgresql+psycopg://sitesense:sitesense@postgis:5432/sitesense, REDIS_URL: redis://redis:6379/0}
+    ports: ["8000:8000"]
+    depends_on: {postgis: {condition: service_healthy}, redis: {condition: service_healthy}, minio-init: {condition: service_completed_successfully}}
+  worker:
+    build: {context: .., dockerfile: apps/worker/Dockerfile}
+    command: uv run celery -A sitesense_worker.tasks.celery_app worker --loglevel=INFO
+    environment: {DATABASE_URL: postgresql+psycopg://sitesense:sitesense@postgis:5432/sitesense, REDIS_URL: redis://redis:6379/0}
+    depends_on: {postgis: {condition: service_healthy}, redis: {condition: service_healthy}}
+  web:
+    build: {context: .., dockerfile: apps/web/Dockerfile}
+    ports: ["3000:3000"]
+    depends_on: [api]

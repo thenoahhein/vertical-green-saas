@@ -1,0 +1,34 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    services:
+      postgis:
+        image: postgis/postgis:16-3.4
+        env: {POSTGRES_DB: sitesense, POSTGRES_USER: sitesense, POSTGRES_PASSWORD: sitesense}
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U sitesense -d sitesense"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with: {version: latest}
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - run: uv sync --extra dev
+      - run: uv run ruff check apps/api apps/worker seed.py
+      - run: uv run mypy apps/api/src apps/worker/src
+      - run: uv run pytest apps/api/tests
+  web:
+    runs-on: ubuntu-latest
+    defaults: {run: {working-directory: apps/web}}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: {node-version: "22", cache: npm, cache-dependency-path: apps/web/package-lock.json}
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm run build
