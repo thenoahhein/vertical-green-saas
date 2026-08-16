@@ -1,10 +1,24 @@
 from uuid import UUID
 
+import numpy as np
 import pytest
+from rasterio.io import MemoryFile
+from rasterio.transform import from_origin
 from sitesense.models import Job, JobStage, Project
 from sitesense.terrain import TerrainSourceError
 from sitesense_worker import tasks
 from sqlalchemy import select
+
+
+def test_cog_round_trip_preserves_valid_raster_values() -> None:
+    source = np.arange(100, dtype="float32").reshape(10, 10)
+    content = tasks._write_cog(source, from_origin(0, 10, 1, 1), "EPSG:26914", -9999.0)
+    with MemoryFile(content).open() as dataset:
+        round_trip = dataset.read(1, masked=True)
+    assert round_trip.count() == source.size
+    assert float(round_trip.min()) == pytest.approx(float(source.min()))
+    assert float(round_trip.max()) == pytest.approx(float(source.max()))
+    assert float(round_trip.mean()) == pytest.approx(float(source.mean()))
 
 
 @pytest.mark.asyncio

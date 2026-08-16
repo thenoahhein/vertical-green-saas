@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -44,8 +45,11 @@ from sitesense.models import (
 )
 from sitesense.terrain import (
     DEFAULT_TERRAIN_BUFFER_METERS,
+    TerrainProduct,
+    TerrainSelection,
     TerrainSourceError,
     analyze_elevation,
+    cached_products_for_bounds,
     read_mosaic,
     select_products,
 )
@@ -95,7 +99,12 @@ def _write_cog(array: np.ndarray, transform_: Any, crs: str, nodata: float) -> b
         ) as dataset:
             dataset.write(array.astype("float32"), 1)
         copy_raster(source_path, output_path, driver="COG", compress="DEFLATE", overview_resampling="average")
-        return output_path.read_bytes()
+        content = output_path.read_bytes()
+        with rasterio.MemoryFile(content).open() as dataset:
+            values = dataset.read(1, masked=True)
+            if not values.count():
+                raise ValueError("COG output contains no valid raster cells.")
+        return content
 
 
 def _upload(key: str, content: bytes) -> None:
@@ -120,11 +129,64 @@ def _source_row(session: Session, product: Any) -> DataSource:
             published_at=product.published_at,
             retrieved_at=datetime.now(UTC),
             spatial_resolution=product.spatial_resolution,
-            notes="TNMAccess-reported byte size is metadata only and is not used as an integrity check.",
+            notes=json.dumps(
+                {
+                    "product_bounds": list(product.bounds),
+                    "title": product.title,
+                    "catalog": "TNMAccess",
+                }
+            ),
         )
         session.add(source)
         session.flush()
     return source
+
+
+def _cached_selection(
+    session: Session,
+    bbox: tuple[float, float, float, float],
+) -> TerrainSelection:
+    cached: list[TerrainProduct] = []
+    rows = session.scalars(
+        select(DataSource).where(DataSource.dataset_name == "Digital Elevation Model (DEM) 1 meter")
+    )
+    for row in rows:
+        if not row.notes:
+            continue
+        try:
+            metadata = json.loads(row.notes)
+            bounds = tuple(float(value) for value in metadata["product_bounds"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        cached.append(
+            TerrainProduct(
+                title=row.name,
+                dataset_name=row.dataset_name,
+                source_url=row.source_url,
+                bounds=bounds,  # type: ignore[arg-type]
+                spatial_resolution=row.spatial_resolution or "1 m",
+                published_at=row.published_at,
+                byte_size=None,
+            )
+        )
+    return cached_products_for_bounds(tuple(cached), bbox)
+
+
+def _select_products_with_cache(
+    session: Session,
+    bbox: tuple[float, float, float, float],
+) -> TerrainSelection:
+    try:
+        return select_products(bbox)
+    except TerrainSourceError as catalog_error:
+        selection = _cached_selection(session, bbox)
+        if not selection.products:
+            raise catalog_error
+        return TerrainSelection(
+            selection.products,
+            True,
+            f"TNMAccess catalog unavailable; cached product fallback used. {catalog_error}",
+        )
 
 
 def _reference_source_row(
@@ -472,7 +534,7 @@ def _terrain_analysis(session: Session, job: Job) -> None:
         float(buffered_wgs84.bounds[2]),
         float(buffered_wgs84.bounds[3]),
     )
-    selection = select_products(buffered_bounds)
+    selection = _select_products_with_cache(session, buffered_bounds)
     sources = [_source_row(session, product) for product in selection.products]
     if not selection.products:
         analysis = SiteAnalysis(
@@ -536,7 +598,10 @@ def _terrain_analysis(session: Session, job: Job) -> None:
         confidence_reason=(
             "1 m 3DEP coverage and 3x3 focal-mean-smoothed planning-grade slope statistics."
             if not selection.used_fallback
-            else "1/3 arc-second fallback coverage and planning-grade slope statistics."
+            else (
+                selection.warning
+                or "Cached or fallback 3DEP coverage and planning-grade slope statistics."
+            )
         ),
     )
     session.add(category)
@@ -547,7 +612,7 @@ def _terrain_analysis(session: Session, job: Job) -> None:
         "terrain_slope": result.slope_percent,
         "terrain_hillshade": result.hillshade,
     }.items():
-        output = np.where(result.buffer_mask & np.isfinite(array), array, -3.4028230607370965e38)
+        output = np.where(np.isfinite(array), array, -3.4028230607370965e38)
         key = f"{object_prefix}/{category_name}.tif"
         _upload(key, _write_cog(output, result.transform, result.crs, -3.4028230607370965e38))
         layer = AnalysisLayer(
@@ -561,6 +626,7 @@ def _terrain_analysis(session: Session, job: Job) -> None:
                 "resolution_m": abs(result.transform.a),
                 "nodata": -3.4028230607370965e38,
                 "source_urls": contributors,
+                "catalog_warning": selection.warning,
             },
         )
         session.add(layer)
@@ -674,7 +740,7 @@ def _terrain_analysis(session: Session, job: Job) -> None:
                 float(expanded_wgs84.bounds[2]),
                 float(expanded_wgs84.bounds[3]),
             )
-            expanded_selection = select_products(expanded_bounds)
+            expanded_selection = _select_products_with_cache(session, expanded_bounds)
             if expanded_selection.products:
                 expanded_elevation, expanded_transform, expanded_crs, expanded_contributors = read_mosaic(
                     expanded_selection.products,
