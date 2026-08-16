@@ -765,14 +765,27 @@ def _terrain_analysis(session: Session, job: Job) -> None:
                 float(expanded_wgs84.bounds[2]),
                 float(expanded_wgs84.bounds[3]),
             )
-            expanded_selection = _select_products_with_cache(session, expanded_bounds)
+            expansion_source_started = time.perf_counter()
+            expanded_selection = (
+                _cached_selection(session, expanded_bounds)
+                if selection.used_fallback
+                else _select_products_with_cache(session, expanded_bounds)
+            )
+            hydrology_stage_timings["expansion_source_selection"] = (
+                time.perf_counter() - expansion_source_started
+            )
             if expanded_selection.products:
+                expansion_mosaic_started = time.perf_counter()
                 expanded_elevation, expanded_transform, expanded_crs, expanded_contributors = read_mosaic(
                     expanded_selection.products,
                     expanded_bounds,
                     "EPSG:26914",
-                    resolution=5.0,
+                    resolution=10.0,
                 )
+                hydrology_stage_timings["expansion_mosaic_read"] = (
+                    time.perf_counter() - expansion_mosaic_started
+                )
+                expansion_hydrology_started = time.perf_counter()
                 hydrology_result = run_hydrology(
                     expanded_elevation,
                     expanded_transform,
@@ -780,11 +793,14 @@ def _terrain_analysis(session: Session, job: Job) -> None:
                     parcel_projected,
                     parcel.computed_acres,
                 )
+                hydrology_stage_timings["expansion_hydrology"] = (
+                    time.perf_counter() - expansion_hydrology_started
+                )
                 buffered_projected = expanded_projected
                 buffered_bounds = expanded_bounds
                 contributors = expanded_contributors
                 hydrology_result.metrics["routing_resolution_m"] = abs(expanded_transform.a)
-                hydrology_result.metrics["expansion_routing_resolution_m"] = 5.0
+                hydrology_result.metrics["expansion_routing_resolution_m"] = 10.0
                 for product in expanded_selection.products:
                     if product.source_url not in [source.source_url for source in sources]:
                         sources.append(_source_row(session, product))

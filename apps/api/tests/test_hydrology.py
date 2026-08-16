@@ -11,6 +11,7 @@ from sitesense.hydrology import (
     HydrologySourceError,
     WhiteboxBinaryError,
     _corridor_contributing_acres,
+    _vectorize_regions,
     assign_mapped_water_relationships,
     boundary_inflow_mask,
     fetch_3dhp,
@@ -127,6 +128,7 @@ def test_v_valley_routes_to_one_coherent_corridor() -> None:
         box(20, 20, 44, 44),
         1.0,
         stream_threshold_cells=2,
+        ridge_valley_min_length_m=1.0,
     )
     assert result.flow_accumulation[32, 0] <= result.flow_accumulation[32, -1]
     assert result.drainage_lines
@@ -134,6 +136,22 @@ def test_v_valley_routes_to_one_coherent_corridor() -> None:
     assert result.corridors
     assert any(corridor.parcel_length_m > 0 for corridor in result.corridors)
     assert result.metrics["drainage_vectorization_method"] == "whitebox-raster-streams-to-vector"
+
+
+def test_subbasin_vectorization_preserves_distinct_ids() -> None:
+    values = np.array(
+        [
+            [1, 1, 0, 2, 2],
+            [1, 1, 0, 2, 2],
+            [0, 0, 0, 0, 0],
+            [3, 3, 3, 0, 0],
+            [3, 3, 3, 0, 0],
+        ],
+        dtype="float32",
+    )
+    regions = _vectorize_regions(values, from_origin(0, 5, 1, 1), lambda raster: raster > 0)
+    assert len(regions) == 3
+    assert sorted(round(region.area) for region in regions) == [4, 4, 6]
 
 
 def test_tilted_plane_routes_downhill() -> None:

@@ -28,9 +28,10 @@ DEFAULT_WINDOW_INFLOW_THRESHOLD_CELLS = 100
 MIN_DEPRESSION_AREA_M2 = 9.0
 MIN_DEPRESSION_DEPTH_M = 0.3
 MIN_CATCHMENT_AREA_M2 = 100.0
-MIN_RIDGE_VALLEY_LENGTH_M = 1.0
+MIN_RIDGE_VALLEY_LENGTH_M = 100.0
 MAX_RETAINED_POLYGONS = 5_000
 MAX_RETAINED_LINES = 5_000
+MAX_RETAINED_RIDGE_VALLEY_LINES = 100
 HYDROGRAPHY_URL = (
     "https://3dhp.nationalmap.gov/arcgis/rest/services/usgs_3dhp_all/FeatureServer"
 )
@@ -153,9 +154,27 @@ def _vectorize_mask(
     return result
 
 
+def _vectorize_regions(
+    values: np.ndarray,
+    transform: Affine,
+    predicate: Any,
+) -> list[Polygon]:
+    """Polygonize each distinct positive raster region without merging IDs."""
+    result: list[Polygon] = []
+    mask = predicate(values)
+    for geometry, value in shapes(values.astype("float32"), mask=mask, transform=transform):
+        if value > 0:
+            candidate = shape(geometry)
+            if isinstance(candidate, Polygon) and not candidate.is_empty:
+                result.append(candidate)
+    return result
+
+
 def _line_parts(geometry: Any) -> list[LineString | MultiLineString]:
-    if geometry.geom_type in {"LineString", "MultiLineString"}:
+    if geometry.geom_type == "LineString":
         return [geometry]
+    if geometry.geom_type == "MultiLineString":
+        return [part for part in geometry.geoms if not part.is_empty]
     if hasattr(geometry, "geoms"):
         parts: list[LineString | MultiLineString] = []
         for part in geometry.geoms:
@@ -199,7 +218,7 @@ def _raster_mask_to_lines(
             segments.append(LineString([(x1, y1), (x2, y2)]))
     if not segments:
         return []
-    return _line_parts(linemerge(unary_union(segments)))
+    return [linemerge(unary_union(segments))]
 
 
 def _corridor_contributing_acres(
@@ -246,10 +265,11 @@ def _cap_polygons(polygons: list[Polygon]) -> tuple[list[Polygon], bool]:
 
 def _cap_lines(
     lines: list[LineString | MultiLineString],
+    maximum: int = MAX_RETAINED_LINES,
 ) -> tuple[list[LineString | MultiLineString], bool]:
-    if len(lines) <= MAX_RETAINED_LINES:
+    if len(lines) <= maximum:
         return lines, False
-    return sorted(lines, key=lambda line: line.length, reverse=True)[:MAX_RETAINED_LINES], True
+    return sorted(lines, key=lambda line: line.length, reverse=True)[:maximum], True
 
 
 def stream_threshold_cells_for_resolution(
@@ -364,6 +384,7 @@ def run_hydrology(
     stream_threshold_area_m2: float = DEFAULT_STREAM_THRESHOLD_AREA_M2,
     stream_threshold_cells: int | None = None,
     inflow_threshold_cells: int = DEFAULT_WINDOW_INFLOW_THRESHOLD_CELLS,
+    ridge_valley_min_length_m: float = MIN_RIDGE_VALLEY_LENGTH_M,
 ) -> HydrologyResult:
     """Run the complete local routing workflow in a cleaned per-job directory."""
     workflow_started = time.perf_counter()
@@ -479,7 +500,7 @@ def run_hydrology(
     filtering_started = time.perf_counter()
     raw_catchments = [
         polygon
-        for polygon in _vectorize_mask(subbasins, transform, lambda values: values > 0)
+        for polygon in _vectorize_regions(subbasins, transform, lambda values: values > 0)
         if polygon.area >= MIN_CATCHMENT_AREA_M2
     ]
     raw_catchments, catchments_capped = _cap_polygons(raw_catchments)
@@ -504,13 +525,15 @@ def run_hydrology(
         raw_depressions, elevation, conditioned, transform, pixel_area
     )
     ridgelines = _filter_lines_by_length(
-        _raster_mask_to_lines(ridges, transform), MIN_RIDGE_VALLEY_LENGTH_M
+        _raster_mask_to_lines(ridges, transform), ridge_valley_min_length_m
     )
     valleys = _filter_lines_by_length(
-        _raster_mask_to_lines(valley_raster, transform), MIN_RIDGE_VALLEY_LENGTH_M
+        _raster_mask_to_lines(valley_raster, transform), ridge_valley_min_length_m
     )
-    ridgelines, ridges_capped = _cap_lines(ridgelines)
-    valleys, valleys_capped = _cap_lines(valleys)
+    ridgelines = [part for line in ridgelines for part in _line_parts(line)]
+    valleys = [part for line in valleys for part in _line_parts(line)]
+    ridgelines, ridges_capped = _cap_lines(ridgelines, MAX_RETAINED_RIDGE_VALLEY_LINES)
+    valleys, valleys_capped = _cap_lines(valleys, MAX_RETAINED_RIDGE_VALLEY_LINES)
     if catchments_capped or depressions_capped or ridges_capped or valleys_capped:
         warnings.append(
             {
@@ -572,7 +595,7 @@ def run_hydrology(
         "depression_min_area_m2": MIN_DEPRESSION_AREA_M2,
         "depression_min_depth_m": MIN_DEPRESSION_DEPTH_M,
         "catchment_min_area_m2": MIN_CATCHMENT_AREA_M2,
-        "ridge_valley_min_length_m": MIN_RIDGE_VALLEY_LENGTH_M,
+        "ridge_valley_min_length_m": ridge_valley_min_length_m,
         "valid_cell_count": int(np.count_nonzero(valid)),
         "max_flow_accumulation_cells": float(np.nanmax(flow_accumulation)),
         "parcel_acres": parcel_acres,
