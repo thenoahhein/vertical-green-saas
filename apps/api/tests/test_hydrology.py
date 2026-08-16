@@ -16,6 +16,7 @@ from sitesense.hydrology import (
     boundary_inflow_mask,
     fetch_3dhp,
     fetch_wbd_membership,
+    merge_context_metrics,
     run_hydrology,
     stream_threshold_cells_for_resolution,
     whitebox_binary_path,
@@ -103,6 +104,29 @@ def test_stream_threshold_preserves_contributing_area_across_resolutions() -> No
     assert five_m == 324
     assert one_m * 1.0**2 >= area_m2
     assert five_m * 5.0**2 >= area_m2
+
+
+def test_context_metrics_keep_local_product_resolution() -> None:
+    local = {
+        "routing_resolution_m": 1.0,
+        "local_depression_count": 4,
+        "contributing_acres_within_window": 12.0,
+        "window_truncated": True,
+    }
+    context = {
+        "routing_resolution_m": 10.0,
+        "contributing_acres_within_window": 240.0,
+        "contributing_acres_is_lower_bound": True,
+        "window_boundary_inflow_cells": 3,
+        "window_boundary_inflow_max_cells": 900,
+        "window_boundary_inflow_max_inward_cells": 500,
+        "window_truncated": True,
+    }
+    merged = merge_context_metrics(local, context)
+    assert merged["local_depression_count"] == 4
+    assert merged["local_routing_resolution_m"] == 1.0
+    assert merged["context_routing_resolution_m"] == 10.0
+    assert merged["contributing_acres_within_window"] == 240.0
 
 def test_missing_whitebox_binary_is_typed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("sitesense.hydrology.whitebox_binary_path", lambda: (_ for _ in ()).throw(WhiteboxBinaryError("missing")))

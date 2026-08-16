@@ -211,6 +211,10 @@ because it passes `isfinite`.
 Hydrology expansion routing uses a 10 m grid while the local parcel window
 remains at source resolution. The routing resolution is recorded in metrics
 and layer metadata; coarse expansion rasters are not parcel-grade products.
+When expansion is required, parcel products and parcel-intersecting corridors
+remain sourced from the local run, while contributing-area metrics and the
+wider context drainage network come from the expanded run. Persisted layers
+identify their local or coarse-context window and routing resolution.
 To bound pathological vectorization, at most 5,000 polygons and 5,000
 line features are retained per product family, ranked by area or length.
 When a cap applies, the analysis emits `hydrology_products_capped` rather

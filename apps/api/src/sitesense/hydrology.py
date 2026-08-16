@@ -86,6 +86,26 @@ class HydrologyResult:
     stage_timings: dict[str, float]
 
 
+def merge_context_metrics(
+    local_metrics: dict[str, float | int | str | bool | None],
+    context_metrics: dict[str, float | int | str | bool | None],
+) -> dict[str, float | int | str | bool | None]:
+    """Keep parcel-product metrics local while taking context metrics from expansion."""
+    merged = dict(local_metrics)
+    for name in (
+        "contributing_acres_within_window",
+        "contributing_acres_is_lower_bound",
+        "window_boundary_inflow_cells",
+        "window_boundary_inflow_max_cells",
+        "window_boundary_inflow_max_inward_cells",
+        "window_truncated",
+    ):
+        merged[name] = context_metrics[name]
+    merged["local_routing_resolution_m"] = local_metrics["routing_resolution_m"]
+    merged["context_routing_resolution_m"] = context_metrics["routing_resolution_m"]
+    return merged
+
+
 def whitebox_binary_path() -> Path:
     try:
         import whitebox

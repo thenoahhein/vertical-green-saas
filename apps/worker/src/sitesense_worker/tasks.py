@@ -27,6 +27,7 @@ from sitesense.hydrology import (
     feature_geometries,
     fetch_3dhp,
     fetch_wbd_membership,
+    merge_context_metrics,
     run_hydrology,
 )
 from sitesense.jobs import transition_job
@@ -241,8 +242,14 @@ def _persist_hydrology(
     contributors: tuple[str, ...],
     buffer_geometry: Any,
     analysis_buffer_meters: float,
+    context_hydrology: Any | None = None,
+    context_contributors: tuple[str, ...] = (),
+    context_buffer_geometry: Any | None = None,
+    context_buffer_meters: float = 0.0,
 ) -> list[dict[str, object]]:
-    """Persist local hydrology products and return typed warnings."""
+    """Persist local parcel products and optional coarse context products."""
+    context = context_hydrology or hydrology
+    context_geometry = context_buffer_geometry or buffer_geometry
     object_prefix = f"{job.organization_id}/{job.project_id}/analysis/{analysis.id}"
     category = AnalysisCategory(
         organization_id=job.organization_id,
@@ -279,7 +286,10 @@ def _persist_hydrology(
         "valid_cell_count": "cells",
         "max_flow_accumulation_cells": "cells",
     }
-    for name, value in hydrology.metrics.items():
+    metric_values = dict(hydrology.metrics)
+    if context_hydrology is not None:
+        metric_values = merge_context_metrics(hydrology.metrics, context.metrics)
+    for name, value in metric_values.items():
         if value is None or not isinstance(value, (bool, int, float)):
             continue
         session.add(
@@ -304,35 +314,63 @@ def _persist_hydrology(
             )
         )
     raster_outputs = {
-        "hydrology_conditioned_dem": hydrology.conditioned,
-        "hydrology_flow_direction": hydrology.flow_direction,
-        "hydrology_flow_accumulation": hydrology.flow_accumulation,
+        "hydrology_conditioned_dem": (context.conditioned, context),
+        "hydrology_flow_direction": (context.flow_direction, context),
+        "hydrology_flow_accumulation": (context.flow_accumulation, context),
+        "hydrology_local_conditioned_dem": (hydrology.conditioned, hydrology),
+        "hydrology_local_flow_direction": (hydrology.flow_direction, hydrology),
+        "hydrology_local_flow_accumulation": (hydrology.flow_accumulation, hydrology),
     }
+    all_contributors = tuple(dict.fromkeys((*contributors, *context_contributors)))
     source_rows = list(
-        session.scalars(select(DataSource).where(DataSource.source_url.in_(contributors)))
+        session.scalars(select(DataSource).where(DataSource.source_url.in_(all_contributors)))
     )
     pending_layers: list[AnalysisLayer] = []
-    for layer_name, array in raster_outputs.items():
+    for layer_name, (array, raster_hydrology) in raster_outputs.items():
         key = f"{object_prefix}/{layer_name}.tif"
         output_nodata = -9999.0
         output = np.where(valid_data_mask(array, output_nodata), array, output_nodata)
-        _upload(key, _write_cog(output, hydrology.transform, hydrology.crs, output_nodata))
+        _upload(
+            key,
+            _write_cog(
+                output,
+                raster_hydrology.transform,
+                raster_hydrology.crs,
+                output_nodata,
+            ),
+        )
         layer = AnalysisLayer(
             organization_id=job.organization_id,
             analysis_id=analysis.id,
             category=layer_name,
             object_store_key=key,
             layer_metadata={
-                "bounds": list(buffer_geometry.bounds),
-                "crs": hydrology.crs,
-                "resolution_m": abs(hydrology.transform.a),
+                "bounds": list(
+                    context_geometry.bounds
+                    if raster_hydrology is context
+                    else buffer_geometry.bounds
+                ),
+                "crs": raster_hydrology.crs,
+                "resolution_m": abs(raster_hydrology.transform.a),
                 "nodata": -9999.0,
-                "analysis_window_buffer_m": analysis_buffer_meters,
-                "analysis_scope": "within analysis window",
-                "source_urls": list(contributors),
-                "whitebox_binary_version": hydrology.metrics["whitebox_binary_version"],
-                "routing_resolution_m": hydrology.metrics["routing_resolution_m"],
-                "stage_timings": hydrology.stage_timings,
+                "analysis_window_buffer_m": (
+                    context_buffer_meters if raster_hydrology is context else analysis_buffer_meters
+                ),
+                "analysis_scope": (
+                    "coarse expanded context window"
+                    if raster_hydrology is context and context_hydrology is not None
+                    else "parcel local window"
+                ),
+                "source_urls": list(
+                    context_contributors if raster_hydrology is context else contributors
+                ),
+                "whitebox_binary_version": raster_hydrology.metrics[
+                    "whitebox_binary_version"
+                ],
+                "routing_resolution_m": raster_hydrology.metrics["routing_resolution_m"],
+                "stage_timings": (
+                    context.stage_timings if raster_hydrology is context else hydrology.stage_timings
+                ),
             },
         )
         pending_layers.append(layer)
@@ -356,7 +394,8 @@ def _persist_hydrology(
             {
                 "threshold_cells": hydrology.metrics["stream_threshold_cells"],
                 "threshold_area_m2": hydrology.metrics["stream_threshold_area_m2"],
-                "analysis_scope": "within analysis window",
+                "analysis_scope": "parcel local window",
+                "routing_resolution_m": hydrology.metrics["routing_resolution_m"],
                 "potential_water_management_review_required": True,
                 "vectorization_method": hydrology.metrics["drainage_vectorization_method"],
             },
@@ -366,7 +405,8 @@ def _persist_hydrology(
             "hydrology_local_catchments",
             polygon,
             {
-                "analysis_scope": "within analysis window",
+                "analysis_scope": "parcel local window",
+                "routing_resolution_m": hydrology.metrics["routing_resolution_m"],
                 "minimum_area_m2": hydrology.metrics["catchment_min_area_m2"],
                 "part_count": len(polygon.geoms) if polygon.geom_type == "MultiPolygon" else 1,
             },
@@ -377,11 +417,13 @@ def _persist_hydrology(
             depression.geometry,
             {
                 "label": "potential water-management investigation area",
+                "analysis_scope": "parcel local window",
                 "requires_contractor_review": True,
                 "minimum_area_m2": hydrology.metrics["depression_min_area_m2"],
                 "minimum_depth_m": hydrology.metrics["depression_min_depth_m"],
                 "depth_m": depression.depth_m,
                 "volume_m3": depression.volume_m3,
+                "routing_resolution_m": hydrology.metrics["routing_resolution_m"],
             },
         )
     for line in hydrology.ridgelines:
@@ -390,8 +432,10 @@ def _persist_hydrology(
             line,
             {
                 "requires_contractor_review": True,
+                "analysis_scope": "parcel local window",
                 "minimum_length_m": hydrology.metrics["ridge_valley_min_length_m"],
                 "part_count": len(line.geoms) if line.geom_type == "MultiLineString" else 1,
+                "routing_resolution_m": hydrology.metrics["routing_resolution_m"],
             },
         )
     for line in hydrology.valleys:
@@ -400,16 +444,21 @@ def _persist_hydrology(
             line,
             {
                 "requires_contractor_review": True,
+                "analysis_scope": "parcel local window",
                 "minimum_length_m": hydrology.metrics["ridge_valley_min_length_m"],
                 "part_count": len(line.geoms) if line.geom_type == "MultiLineString" else 1,
+                "routing_resolution_m": hydrology.metrics["routing_resolution_m"],
             },
         )
     for corridor in hydrology.corridors:
+        if corridor.parcel_length_m <= 0:
+            continue
         add_geometry_layer(
             "hydrology_corridors",
             corridor.geometry,
             {
                 "contributing_acres_within_window": corridor.contributing_acres,
+                "analysis_scope": "parcel local window",
                 "parcel_length_ft": corridor.parcel_length_m * 3.280839895,
                 "parcel_length_m": corridor.parcel_length_m,
                 "flow_direction_degrees": corridor.flow_direction_degrees,
@@ -422,6 +471,18 @@ def _persist_hydrology(
                 "stage_timings": hydrology.stage_timings,
             },
         )
+    if context_hydrology is not None:
+        for line in context.drainage_lines:
+            add_geometry_layer(
+                "hydrology_context_drainage_lines",
+                line,
+                {
+                    "analysis_scope": "coarse expanded context window",
+                    "routing_resolution_m": context.metrics["routing_resolution_m"],
+                    "threshold_cells": context.metrics["stream_threshold_cells"],
+                    "threshold_area_m2": context.metrics["stream_threshold_area_m2"],
+                },
+            )
     session.add_all(pending_layers)
     session.flush()
     for layer in pending_layers:
@@ -755,6 +816,11 @@ def _terrain_analysis(session: Session, job: Job) -> None:
             parcel_projected,
             parcel.computed_acres,
         )
+        local_hydrology_result = hydrology_result
+        context_hydrology_result = hydrology_result
+        context_contributors: tuple[str, ...] = contributors
+        context_buffered_projected = buffered_projected
+        context_buffer_meters = hydrology_buffer_meters
         if hydrology_result.metrics.get("window_truncated") is True:
             hydrology_buffer_meters = 2000.0
             expanded_projected = parcel_projected.buffer(hydrology_buffer_meters)
@@ -786,7 +852,7 @@ def _terrain_analysis(session: Session, job: Job) -> None:
                     time.perf_counter() - expansion_mosaic_started
                 )
                 expansion_hydrology_started = time.perf_counter()
-                hydrology_result = run_hydrology(
+                context_hydrology_result = run_hydrology(
                     expanded_elevation,
                     expanded_transform,
                     expanded_crs,
@@ -799,8 +865,10 @@ def _terrain_analysis(session: Session, job: Job) -> None:
                 buffered_projected = expanded_projected
                 buffered_bounds = expanded_bounds
                 contributors = expanded_contributors
-                hydrology_result.metrics["routing_resolution_m"] = abs(expanded_transform.a)
-                hydrology_result.metrics["expansion_routing_resolution_m"] = 10.0
+                context_hydrology_result.metrics["expansion_routing_resolution_m"] = 10.0
+                context_contributors = expanded_contributors
+                context_buffered_projected = expanded_projected
+                context_buffer_meters = hydrology_buffer_meters
                 for product in expanded_selection.products:
                     if product.source_url not in [source.source_url for source in sources]:
                         sources.append(_source_row(session, product))
@@ -819,7 +887,7 @@ def _terrain_analysis(session: Session, job: Job) -> None:
             if mapped_geometries is None
             else [transform(projector.transform, geometry) for geometry in mapped_geometries]
         )
-        assign_mapped_water_relationships(hydrology_result, projected_mapped_geometries)
+        assign_mapped_water_relationships(local_hydrology_result, projected_mapped_geometries)
         persistence_started = time.perf_counter()
         hydrology_warnings.extend(
             _persist_hydrology(
@@ -829,13 +897,17 @@ def _terrain_analysis(session: Session, job: Job) -> None:
                 parcel,
                 parcel_projected,
                 inverse,
-                hydrology_result,
+                local_hydrology_result,
                 contributors,
                 buffered_projected,
                 hydrology_buffer_meters,
+                context_hydrology=context_hydrology_result,
+                context_contributors=context_contributors,
+                context_buffer_geometry=context_buffered_projected,
+                context_buffer_meters=context_buffer_meters,
             )
         )
-        hydrology_stage_timings.update(hydrology_result.stage_timings)
+        hydrology_stage_timings.update(local_hydrology_result.stage_timings)
         hydrology_stage_timings["persistence"] = time.perf_counter() - persistence_started
         hydrology_stage_timings["hydrology_total_worker"] = time.perf_counter() - hydrology_started
     except HydrologySourceError as exc:
