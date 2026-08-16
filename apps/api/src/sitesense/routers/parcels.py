@@ -10,7 +10,7 @@ from geoalchemy2.shape import from_shape
 from shapely.geometry import Point, Polygon, shape
 from shapely.geometry.base import BaseGeometry
 from shapely.geometry.geo import mapping
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sitesense.disclaimers import DISCLAIMERS
@@ -174,18 +174,20 @@ async def confirm_parcel(
         )
     )
     existing = existing_result.scalar_one_or_none()
-    project_parcel_result = await db.execute(
-        select(Parcel)
+    other_parcel_result = await db.execute(
+        select(Parcel.id)
         .join(Property, Parcel.property_id == Property.id)
         .where(
             Parcel.organization_id == org.organization_id,
             Property.project_id == project_id,
+            or_(
+                Parcel.appraisal_parcel_id != candidate.parcel_id,
+                Parcel.source_id != source.id,
+            ),
         )
+        .limit(1)
     )
-    project_parcel = project_parcel_result.scalar_one_or_none()
-    if project_parcel is not None and (
-        existing is None or project_parcel.id != existing.id
-    ):
+    if other_parcel_result.scalars().first() is not None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={
