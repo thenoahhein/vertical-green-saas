@@ -34,7 +34,7 @@ async def run() -> None:
             top3 += rank <= 3
         print(f"{case['county']} {case['acreage_band']} rank={rank} n={len(ids)} {case['address']}")
     total = len(cases)
-    print(f"summary top1={top1}/{total} top3={top3}/{total} found={found}/{total}")
+    print(f"top1={top1}/{total} top3={top3}/{total} found={found}/{total}")
 
 
 if __name__ == "__main__":
