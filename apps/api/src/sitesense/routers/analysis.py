@@ -80,6 +80,26 @@ async def analysis(project_id: UUID, db: AsyncSession = Depends(get_db), org: Cu
         .order_by(AnalysisCategory.created_at.desc())
         .limit(1)
     )
+    soils_category = await db.scalar(
+        select(AnalysisCategory)
+        .where(
+            AnalysisCategory.analysis_id == analysis_row.id,
+            AnalysisCategory.category == "soils",
+            AnalysisCategory.organization_id == org.organization_id,
+        )
+        .order_by(AnalysisCategory.created_at.desc())
+        .limit(1)
+    )
+    ecology_category = await db.scalar(
+        select(AnalysisCategory)
+        .where(
+            AnalysisCategory.analysis_id == analysis_row.id,
+            AnalysisCategory.category == "ecology",
+            AnalysisCategory.organization_id == org.organization_id,
+        )
+        .order_by(AnalysisCategory.created_at.desc())
+        .limit(1)
+    )
     metric_result = await db.execute(
         select(DerivedMetric)
         .where(
@@ -89,6 +109,8 @@ async def analysis(project_id: UUID, db: AsyncSession = Depends(get_db), org: Cu
     )
     terrain_payload: dict[str, object] = {}
     hydrology_payload: dict[str, object] = {}
+    soils_payload: dict[str, object] = {}
+    ecology_payload: dict[str, object] = {}
     histogram: dict[str, dict[str, object]] = {}
     for metric in metric_result.scalars():
         if metric.value is None:
@@ -97,12 +119,30 @@ async def analysis(project_id: UUID, db: AsyncSession = Depends(get_db), org: Cu
             _, bucket, suffix = metric.name.split(":", 2)
             histogram.setdefault(bucket, {"bucket": bucket})[suffix] = metric.value
         else:
-            target = hydrology_payload if metric.category == "hydrology" else terrain_payload
+            if metric.category == "hydrology":
+                target = hydrology_payload
+            elif metric.category == "soils":
+                target = soils_payload
+            elif metric.category == "ecology":
+                target = ecology_payload
+            else:
+                target = terrain_payload
             target[metric.name] = metric.value
     if histogram:
         for bucket_payload in histogram.values():
             bucket_payload["percentage_denominator"] = "valid slope pixels"
         terrain_payload["slope_histogram"] = list(histogram.values())
+    for payload, prefix, target_name in (
+        (soils_payload, "hydrologic_group_acres:", "dominant_hydrologic_group"),
+        (ecology_payload, "vegetation_type_acres:", "dominant_vegetation_type"),
+    ):
+        grouped = {
+            name.removeprefix(prefix): value
+            for name, value in payload.items()
+            if name.startswith(prefix) and isinstance(value, (int, float))
+        }
+        if grouped:
+            payload[target_name] = max(grouped, key=lambda name: grouped[name])
     coverage = terrain_payload.get("coverage_fraction")
     warnings: list[dict[str, object]] = []
     if category is not None and "terrain_catalog_unavailable_cached_product" in category.confidence_reason:
@@ -159,12 +199,30 @@ async def analysis(project_id: UUID, db: AsyncSession = Depends(get_db), org: Cu
         hydrology_payload["water_feature_review_label"] = (
             "potential water-management investigation areas"
         )
+    for category_name, payload, category_row in (
+        ("soils", soils_payload, soils_category),
+        ("ecology", ecology_payload, ecology_category),
+    ):
+        if category_row is not None:
+            payload["status"] = category_row.status.value
+            payload["confidence"] = category_row.confidence.value if category_row.confidence else "low"
+            payload["confidence_reason"] = category_row.confidence_reason
+            payload["preliminary_planning_only"] = True
+            if category_row.status.value == "unavailable":
+                warnings.append(
+                    {
+                        "code": f"{category_name}_source_unavailable",
+                        "message": category_row.confidence_reason,
+                    }
+                )
     return AnalysisRead(
         status=category.status.value if category else "unavailable",
         confidence=category.confidence.value if category and category.confidence else "low",
         confidence_reason=category.confidence_reason if category else "Terrain analysis unavailable.",
         terrain=terrain_payload or None,
         hydrology=hydrology_payload or None,
+        soils=soils_payload or None,
+        ecology=ecology_payload or None,
         warnings=warnings,
     )
 

@@ -17,8 +17,10 @@ from geoalchemy2.elements import WKBElement
 from geoalchemy2.shape import from_shape, to_shape
 from pyproj import Transformer
 from rasterio.shutil import copy as copy_raster
+from shapely.geometry import MultiPolygon, Polygon
 from shapely.ops import transform
 from sitesense.config import get_settings
+from sitesense.ecology import EcologyResult, EcologySourceError, run_ecology
 from sitesense.hydrology import (
     HYDROGRAPHY_URL,
     WBD_URL,
@@ -39,12 +41,15 @@ from sitesense.models import (
     Confidence,
     DataSource,
     DerivedMetric,
+    EcologicalUnit,
     Job,
     JobStage,
     Parcel,
     Property,
     SiteAnalysis,
+    SoilUnit,
 )
+from sitesense.soils import SoilsResult, SoilsSourceError, run_soils
 from sitesense.terrain import (
     DEFAULT_TERRAIN_BUFFER_METERS,
     TerrainProduct,
@@ -159,7 +164,15 @@ def _cached_selection(
             continue
         try:
             metadata = json.loads(row.notes)
-            bounds = tuple(float(value) for value in metadata["product_bounds"])
+            bounds_values = tuple(float(value) for value in metadata["product_bounds"])
+            if len(bounds_values) != 4:
+                continue
+            bounds = (
+                bounds_values[0],
+                bounds_values[1],
+                bounds_values[2],
+                bounds_values[3],
+            )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             continue
         cached.append(
@@ -167,7 +180,7 @@ def _cached_selection(
                 title=row.name,
                 dataset_name=row.dataset_name,
                 source_url=row.source_url,
-                bounds=bounds,  # type: ignore[arg-type]
+                bounds=bounds,
                 spatial_resolution=row.spatial_resolution or "1 m",
                 published_at=row.published_at,
                 byte_size=None,
@@ -229,6 +242,247 @@ def _source_ref(session: Session, organization_id: Any, source: DataSource, tabl
             derived_id=derived_id,
         )
     )
+
+
+def _as_multipolygon(geometry: Any) -> Any:
+    if isinstance(geometry, Polygon):
+        return MultiPolygon([geometry])
+    return geometry
+
+
+def _persist_soils(
+    session: Session,
+    job: Job,
+    analysis: SiteAnalysis,
+    result: SoilsResult,
+) -> None:
+    source = _reference_source_row(
+        session,
+        name="USDA Soil Data Access",
+        agency="USDA NRCS",
+        dataset_name="SSURGO soil survey",
+        source_url=result.source_url,
+        access_method="HTTP POST SQL",
+        notes="Preliminary planning data; map units clipped to confirmed parcel.",
+    )
+    category = AnalysisCategory(
+        organization_id=job.organization_id,
+        analysis_id=analysis.id,
+        category="soils",
+        status=CategoryStatus.complete,
+        confidence=Confidence.medium,
+        confidence_reason=(
+            "SSURGO map units and dominant components are preliminary planning data requiring "
+            "field verification and professional review. Hydrologic group, drainage class, "
+            "surface ksat, and slope metrics use each map unit's dominant component."
+        ),
+    )
+    session.add(category)
+    session.flush()
+    metric_units = {
+        "parcel_acres": "acres",
+        "covered_acres": "acres",
+        "coverage_fraction": "fraction",
+        "area_weighted_representative_slope": "percent",
+        "surface_ksat_min": "micrometres_per_second",
+        "surface_ksat_max": "micrometres_per_second",
+        "sda_reported_acres": "acres",
+    }
+    for name, value in result.metrics.items():
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            session.add(DerivedMetric(
+                organization_id=job.organization_id,
+                analysis_id=analysis.id,
+                category="soils",
+                name=name,
+                value=float(value),
+                unit=metric_units.get(name, "number"),
+            ))
+    for prefix, values in (
+        ("hydrologic_group_acres", result.metrics.get("hydrologic_group_acres", {})),
+        ("drainage_class_acres", result.metrics.get("drainage_class_acres", {})),
+    ):
+        if isinstance(values, dict):
+            for label, value in values.items():
+                session.add(DerivedMetric(
+                    organization_id=job.organization_id,
+                    analysis_id=analysis.id,
+                    category="soils",
+                    name=f"{prefix}:{label}",
+                    value=float(value),
+                    unit="acres",
+                ))
+    for unit in result.units:
+        dominant = unit.dominant_component
+        row = SoilUnit(
+            organization_id=job.organization_id,
+            analysis_id=analysis.id,
+            geometry=from_shape(_as_multipolygon(unit.geometry), srid=4326),
+            mukey=unit.mukey,
+            musym=unit.musym,
+            map_unit_name=unit.map_unit_name,
+            acres=unit.acres,
+            parcel_percent=unit.parcel_percent,
+            dominant_component_name=dominant.name if dominant else None,
+            component_percent=dominant.percent if dominant else None,
+            slope_low=dominant.slope_low if dominant else None,
+            slope_representative=dominant.slope_representative if dominant else None,
+            slope_high=dominant.slope_high if dominant else None,
+            drainage_class=dominant.drainage_class if dominant else None,
+            hydrologic_group=dominant.hydrologic_group if dominant else None,
+            available_water_storage=dominant.available_water_storage if dominant else None,
+            ksat=dominant.ksat if dominant else None,
+            depth_to_restrictive_layer=dominant.depth_to_restrictive_layer if dominant else None,
+            flooding_frequency=dominant.flooding_frequency if dominant else None,
+            ponding_class=dominant.ponding_class if dominant else None,
+            farmland_classification=dominant.farmland_classification if dominant else None,
+        )
+        session.add(row)
+        session.flush()
+        _source_ref(session, job.organization_id, source, "soil_units", row.id)
+        layer = AnalysisLayer(
+            organization_id=job.organization_id,
+            analysis_id=analysis.id,
+            category="soils",
+            geometry=from_shape(_as_multipolygon(unit.geometry), srid=4326),
+            layer_metadata={
+                "mukey": unit.mukey,
+                "sda_reported_acres": unit.reported_acres,
+                "computed_acres": unit.acres,
+                "parcel_percent": unit.parcel_percent,
+                "components": [
+                    {
+                        "cokey": component.cokey,
+                        "name": component.name,
+                        "percent": component.percent,
+                        "hydrologic_group": component.hydrologic_group,
+                        "drainage_class": component.drainage_class,
+                        "slope_low": component.slope_low,
+                        "slope_representative": component.slope_representative,
+                        "slope_high": component.slope_high,
+                        "ksat": component.ksat,
+                        "available_water_storage": component.available_water_storage,
+                        "depth_to_restrictive_layer": component.depth_to_restrictive_layer,
+                        "flooding_frequency": component.flooding_frequency,
+                        "ponding_class": component.ponding_class,
+                    }
+                    for component in unit.components
+                ],
+                "stage_timings": result.stage_timings,
+                "dominant_component_rule": (
+                    "Hydrologic group, drainage class, surface ksat, and slope metrics use "
+                    "the component with the highest comppct_r within each map unit."
+                ),
+                "aoi_acres": result.metrics.get("aoi_acres"),
+                "aoi_geometry_method": result.metrics.get("aoi_geometry_method", "native_wkt"),
+                "preliminary_planning_only": True,
+            },
+        )
+        session.add(layer)
+        session.flush()
+        _source_ref(session, job.organization_id, source, "analysis_layers", layer.id)
+
+
+def _persist_ecology(
+    session: Session,
+    job: Job,
+    analysis: SiteAnalysis,
+    result: EcologyResult,
+) -> None:
+    source = _reference_source_row(
+        session,
+        name="TPWD Ecological Mapping Systems 2020",
+        agency="Texas Parks and Wildlife Department",
+        dataset_name="Ecological Mapping Systems 2020 vector",
+        source_url=result.source_url,
+        access_method="ArcGIS REST vector query",
+        notes=f"Answered TPWD layer IDs: {list(result.answered_layers)}.",
+    )
+    category = AnalysisCategory(
+        organization_id=job.organization_id,
+        analysis_id=analysis.id,
+        category="ecology",
+        status=CategoryStatus.complete,
+        confidence=Confidence.medium,
+        confidence_reason=(
+            "TPWD EMS 2020 vector classifications are preliminary planning data requiring "
+            "field verification and professional review."
+        ),
+    )
+    session.add(category)
+    session.flush()
+    for name, value in result.metrics.items():
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            session.add(DerivedMetric(
+                organization_id=job.organization_id,
+                analysis_id=analysis.id,
+                category="ecology",
+                name=name,
+                value=float(value),
+                unit="acres" if name.endswith("_acres") else "fraction" if "fraction" in name else "number",
+            ))
+    vegetation_acres = result.metrics.get("vegetation_type_acres", {})
+    if isinstance(vegetation_acres, dict):
+        for label, value in vegetation_acres.items():
+            session.add(DerivedMetric(
+                organization_id=job.organization_id,
+                analysis_id=analysis.id,
+                category="ecology",
+                name=f"vegetation_type_acres:{label}",
+                value=float(value),
+                unit="acres",
+            ))
+    for unit in result.units:
+        row = EcologicalUnit(
+            organization_id=job.organization_id,
+            analysis_id=analysis.id,
+            geometry=from_shape(_as_multipolygon(unit.geometry), srid=4326),
+            system_vegetation_type=unit.system_vegetation_type,
+            source_classification_code=unit.source_classification_code,
+            acres=unit.acres,
+            parcel_percent=unit.parcel_percent,
+            source=unit.source,
+        )
+        session.add(row)
+        session.flush()
+        _source_ref(session, job.organization_id, source, "ecological_units", row.id)
+        layer = AnalysisLayer(
+            organization_id=job.organization_id,
+            analysis_id=analysis.id,
+            category="ecology",
+            geometry=from_shape(_as_multipolygon(unit.geometry), srid=4326),
+            layer_metadata={
+                "source_layer_id": unit.layer_id,
+                "source_layer_name": unit.layer_name,
+                "acres": unit.acres,
+                "parcel_percent": unit.parcel_percent,
+                "stage_timings": result.stage_timings,
+                "answered_layer_ids": list(result.answered_layers),
+                "pinned_fields": {"vegetation_type": "CommonName", "classification_code": "Veg_ID"},
+                "warnings": result.warnings,
+                "preliminary_planning_only": True,
+            },
+        )
+        session.add(layer)
+        session.flush()
+        _source_ref(session, job.organization_id, source, "analysis_layers", layer.id)
+
+
+def _persist_category_unavailable(
+    session: Session,
+    job: Job,
+    analysis: SiteAnalysis,
+    category_name: str,
+    reason: str,
+) -> None:
+    session.add(AnalysisCategory(
+        organization_id=job.organization_id,
+        analysis_id=analysis.id,
+        category=category_name,
+        status=CategoryStatus.unavailable,
+        confidence=Confidence.low,
+        confidence_reason=reason,
+    ))
 
 
 def _persist_hydrology(
@@ -912,17 +1166,56 @@ def _terrain_analysis(session: Session, job: Job) -> None:
         hydrology_stage_timings["hydrology_total_worker"] = time.perf_counter() - hydrology_started
     except HydrologySourceError as exc:
         hydrology_warnings.append({"code": "hydrology_unavailable", "message": str(exc)})
-        session.add(
-            AnalysisCategory(
-                organization_id=job.organization_id,
-                analysis_id=analysis.id,
-                category="hydrology",
-                status=CategoryStatus.unavailable,
-                confidence=Confidence.low,
-                confidence_reason=str(exc),
+        _persist_category_unavailable(session, job, analysis, "hydrology", str(exc))
+    soils_warnings: list[dict[str, Any]] = []
+    ecology_warnings: list[dict[str, Any]] = []
+    soils_stage_timings: dict[str, float] = {}
+    ecology_stage_timings: dict[str, float] = {}
+    soils_available = False
+    ecology_available = False
+    try:
+        soils_started = time.perf_counter()
+        soils_result = run_soils(source_geometry, float(parcel.computed_acres or 0.0))
+        soils_stage_timings.update(soils_result.stage_timings)
+        soils_stage_timings["soils_total"] = time.perf_counter() - soils_started
+        soils_warnings.extend(soils_result.warnings)
+        if soils_result.units:
+            _persist_soils(session, job, analysis, soils_result)
+            soils_available = True
+        else:
+            _persist_category_unavailable(
+                session,
+                job,
+                analysis,
+                "soils",
+                str(soils_warnings[-1].get("message") if soils_warnings else "SDA returned no map units."),
             )
-        )
+    except SoilsSourceError as exc:
+        soils_warnings.append({"code": "soils_source_unavailable", "message": str(exc)})
+        _persist_category_unavailable(session, job, analysis, "soils", str(exc))
+    try:
+        ecology_started = time.perf_counter()
+        ecology_result = run_ecology(source_geometry, float(parcel.computed_acres or 0.0))
+        ecology_stage_timings.update(ecology_result.stage_timings)
+        ecology_stage_timings["ecology_total"] = time.perf_counter() - ecology_started
+        ecology_warnings.extend(ecology_result.warnings)
+        if ecology_result.units:
+            _persist_ecology(session, job, analysis, ecology_result)
+            ecology_available = True
+        else:
+            _persist_category_unavailable(
+                session,
+                job,
+                analysis,
+                "ecology",
+                str(ecology_warnings[-1].get("message") if ecology_warnings else "TPWD returned no ecological features."),
+            )
+    except EcologySourceError as exc:
+        ecology_warnings.append({"code": "ecology_source_unavailable", "message": str(exc)})
+        _persist_category_unavailable(session, job, analysis, "ecology", str(exc))
     all_warnings = ([result.warning] if result.warning else []) + hydrology_warnings
+    all_warnings.extend(soils_warnings)
+    all_warnings.extend(ecology_warnings)
     _set_job(
         session,
         job,
@@ -930,7 +1223,14 @@ def _terrain_analysis(session: Session, job: Job) -> None:
         {
             "terrain": "complete",
             "hydrology": "partial" if hydrology_warnings else "complete",
-            "stage_timings": {**stage_timings, **hydrology_stage_timings},
+            "soils": "complete" if soils_available else "unavailable",
+            "ecology": "complete" if ecology_available else "unavailable",
+            "stage_timings": {
+                **stage_timings,
+                **hydrology_stage_timings,
+                **soils_stage_timings,
+                **ecology_stage_timings,
+            },
         },
         "; ".join(
             str(warning.get("message"))
