@@ -168,8 +168,9 @@ def run_wetlands(
             source_acres_value = _attribute(attributes, "Wetlands.ACRES")
             source_acres = None if source_acres_value is None else float(source_acres_value)
             geometry = _geometry(feature["geometry"])
-            intersects = geometry.intersects(parcel_geometry)
-            clipped = geometry.intersection(parcel_geometry) if intersects else geometry.intersection(buffered_geometry)
+            intersection = geometry.intersection(parcel_geometry)
+            intersects = not intersection.is_empty and intersection.area > 0
+            clipped = intersection if intersects else geometry.intersection(buffered_geometry)
             if clipped.is_empty:
                 continue
             distance = 0.0 if intersects else float(

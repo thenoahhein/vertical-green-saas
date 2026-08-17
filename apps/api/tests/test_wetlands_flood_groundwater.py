@@ -85,6 +85,26 @@ def test_wetlands_adjacent_acres_are_buffer_scoped() -> None:
     assert result.metrics["adjacent_buffer_wetland_acres"] == unit.acres
 
 
+def test_wetlands_boundary_touch_is_adjacent() -> None:
+    touching = _wetland_feature()
+    touching["geometry"] = {
+        "type": "Polygon",
+        "coordinates": [[
+            [-96.998, 30.0], [-96.997, 30.0], [-96.997, 30.001],
+            [-96.998, 30.001], [-96.998, 30.0],
+        ]],
+    }
+    result = run_wetlands(
+        box(-97.0, 30.0, -96.998, 30.001),
+        10.0,
+        WetlandsClient([{"features": [touching]}, {"features": []}]),
+    )
+    assert result.metrics["wetland_count"] == 0
+    assert result.metrics["adjacent_wetland_count"] == 1
+    assert result.units[0].intersects_parcel is False
+    assert result.units[0].acres > 0
+
+
 def test_wetlands_and_flood_multipart_geometry_preserves_holes() -> None:
     exterior_one = [[-97.0, 30.0], [-96.999, 30.0], [-96.999, 30.001], [-97.0, 30.001], [-97.0, 30.0]]
     hole = [[-96.9998, 30.0002], [-96.9992, 30.0002], [-96.9992, 30.0008], [-96.9998, 30.0008], [-96.9998, 30.0002]]
