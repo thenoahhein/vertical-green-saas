@@ -21,6 +21,8 @@ from shapely.geometry import MultiPolygon, Polygon
 from shapely.ops import transform
 from sitesense.config import get_settings
 from sitesense.ecology import EcologyResult, EcologySourceError, run_ecology
+from sitesense.flood import FloodResult, FloodSourceError, run_flood
+from sitesense.groundwater import GroundwaterResult, GroundwaterSourceError, run_groundwater
 from sitesense.hydrology import (
     HYDROGRAPHY_URL,
     WBD_URL,
@@ -42,12 +44,15 @@ from sitesense.models import (
     DataSource,
     DerivedMetric,
     EcologicalUnit,
+    FloodZone,
     Job,
     JobStage,
     Parcel,
     Property,
     SiteAnalysis,
     SoilUnit,
+    Well,
+    Wetland,
 )
 from sitesense.soils import SoilsResult, SoilsSourceError, run_soils
 from sitesense.terrain import (
@@ -61,6 +66,7 @@ from sitesense.terrain import (
     select_products,
     valid_data_mask,
 )
+from sitesense.wetlands import WetlandsResult, WetlandsSourceError, run_wetlands
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
@@ -459,6 +465,235 @@ def _persist_ecology(
                 "stage_timings": result.stage_timings,
                 "answered_layer_ids": list(result.answered_layers),
                 "pinned_fields": {"vegetation_type": "CommonName", "classification_code": "Veg_ID"},
+                "warnings": result.warnings,
+                "preliminary_planning_only": True,
+            },
+        )
+        session.add(layer)
+        session.flush()
+        _source_ref(session, job.organization_id, source, "analysis_layers", layer.id)
+
+
+def _persist_wetlands(
+    session: Session,
+    job: Job,
+    analysis: SiteAnalysis,
+    result: WetlandsResult,
+) -> None:
+    source = DataSource(
+        agency="USFWS",
+        name="USFWS National Wetlands Inventory",
+        dataset_name="National Wetlands Inventory",
+        source_url=result.source_url,
+        access_method="ArcGIS REST query",
+        retrieved_at=result.retrieved_at,
+        spatial_resolution="approximately 1:12,000",
+    )
+    session.add(source)
+    session.flush()
+    session.add(AnalysisCategory(
+        organization_id=job.organization_id,
+        analysis_id=analysis.id,
+        category="wetlands",
+        status=CategoryStatus.complete,
+        confidence=Confidence.medium,
+        confidence_reason="NWI remote-sensing screening; field delineation and USACE review are required.",
+    ))
+    for name, value, metric_unit in (
+        ("wetland_acres", result.metrics.get("wetland_acres"), "acres"),
+        ("adjacent_wetland_acres", result.metrics.get("adjacent_wetland_acres"), "acres"),
+        ("wetland_count", result.metrics.get("wetland_count"), "count"),
+        ("adjacent_wetland_count", result.metrics.get("adjacent_wetland_count"), "count"),
+    ):
+        session.add(DerivedMetric(
+            organization_id=job.organization_id, analysis_id=analysis.id, category="wetlands",
+            name=name, value=float(value or 0.0), unit=metric_unit,
+        ))
+    for unit in result.units:
+        row = Wetland(
+            organization_id=job.organization_id,
+            analysis_id=analysis.id,
+            geometry=from_shape(_as_multipolygon(unit.geometry), srid=4326),
+            nwi_attribute_code=unit.nwi_attribute_code,
+            wetland_type=unit.wetland_type,
+            acres=unit.acres,
+            intersects_parcel=unit.intersects_parcel,
+        )
+        session.add(row)
+        session.flush()
+        _source_ref(session, job.organization_id, source, "wetlands", row.id)
+        layer = AnalysisLayer(
+            organization_id=job.organization_id,
+            analysis_id=analysis.id,
+            category="wetlands",
+            geometry=from_shape(_as_multipolygon(unit.geometry), srid=4326),
+            layer_metadata={
+                "source_acres": unit.source_acres,
+                "acres_semantics": "clipped EPSG:6579 acreage" if unit.intersects_parcel else "source-reported acreage",
+                "intersects_parcel": unit.intersects_parcel,
+                "distance_to_parcel_m": unit.distance_to_parcel_m,
+                "stage_timings": result.stage_timings,
+                "warnings": result.warnings,
+                "preliminary_planning_only": True,
+            },
+        )
+        session.add(layer)
+        session.flush()
+        _source_ref(session, job.organization_id, source, "analysis_layers", layer.id)
+
+
+def _persist_flood(
+    session: Session,
+    job: Job,
+    analysis: SiteAnalysis,
+    result: FloodResult,
+) -> None:
+    source = DataSource(
+        agency="FEMA",
+        name="FEMA National Flood Hazard Layer",
+        dataset_name="National Flood Hazard Layer",
+        source_url=result.source_url,
+        access_method="ArcGIS REST query",
+        retrieved_at=result.retrieved_at,
+        spatial_resolution=None,
+    )
+    session.add(source)
+    session.flush()
+    ble_source = DataSource(
+        agency="TWDB",
+        name="TWDB Texas BLE status",
+        dataset_name="Texas BLE status",
+        source_url="https://gis1.twdb.texas.gov/server/rest/services/WSC-FSCA-FM/Texas_BLE_Status/MapServer",
+        access_method="ArcGIS REST query",
+        retrieved_at=result.retrieved_at,
+        spatial_resolution=None,
+    )
+    session.add(ble_source)
+    session.flush()
+    session.add(AnalysisCategory(
+        organization_id=job.organization_id,
+        analysis_id=analysis.id,
+        category="flood",
+        status=CategoryStatus.complete,
+        confidence=Confidence.medium if result.warnings else Confidence.high,
+        confidence_reason="FEMA NFHL screening with TWDB BLE status context; not an engineering determination.",
+    ))
+    for name, value, metric_unit in (
+        ("fema_zone_acres", result.metrics.get("fema_zone_acres"), "acres"),
+        ("sfha_acres", result.metrics.get("sfha_acres"), "acres"),
+        ("floodway_acres", result.metrics.get("floodway_acres"), "acres"),
+        ("static_bfe_min", result.metrics.get("static_bfe_min"), "feet"),
+        ("static_bfe_max", result.metrics.get("static_bfe_max"), "feet"),
+        ("fema_zone_count", result.metrics.get("fema_zone_count"), "count"),
+        ("twdb_ble_status_count", result.metrics.get("twdb_ble_status_count"), "count"),
+    ):
+        if value is not None:
+            session.add(DerivedMetric(
+                organization_id=job.organization_id, analysis_id=analysis.id, category="flood",
+                name=name, value=float(value), unit=metric_unit,
+            ))
+    for unit in result.zones:
+        source_row = ble_source if unit.source_discriminator == "TWDB BLE status" else source
+        row = FloodZone(
+            organization_id=job.organization_id,
+            analysis_id=analysis.id,
+            geometry=from_shape(_as_multipolygon(unit.geometry), srid=4326),
+            zone_classification=unit.zone_classification,
+            source_discriminator=unit.source_discriminator,
+            acres_intersected=unit.acres_intersected,
+            parcel_percent=unit.parcel_percent,
+            annual_chance=unit.annual_chance,
+        )
+        session.add(row)
+        session.flush()
+        _source_ref(session, job.organization_id, source_row, "flood_zones", row.id)
+        layer = AnalysisLayer(
+            organization_id=job.organization_id,
+            analysis_id=analysis.id,
+            category="flood",
+            geometry=from_shape(_as_multipolygon(unit.geometry), srid=4326),
+            layer_metadata={
+                "source_discriminator": unit.source_discriminator,
+                "source_attributes": unit.attributes,
+                "sentinel_normalization": "-9999 converted to null",
+                "annual_chance_mapping": "explicit NFHL mapping",
+                "stage_timings": result.stage_timings,
+                "warnings": result.warnings,
+                "preliminary_planning_only": True,
+            },
+        )
+        session.add(layer)
+        session.flush()
+        _source_ref(session, job.organization_id, source_row, "analysis_layers", layer.id)
+
+
+def _persist_groundwater(
+    session: Session,
+    job: Job,
+    analysis: SiteAnalysis,
+    result: GroundwaterResult,
+) -> None:
+    source = DataSource(
+        agency="TWDB",
+        name="TWDB Groundwater database",
+        dataset_name="TWDB Groundwater database",
+        source_url=result.source_url,
+        access_method="ArcGIS REST query",
+        retrieved_at=result.retrieved_at,
+        spatial_resolution=None,
+    )
+    session.add(source)
+    session.flush()
+    session.add(AnalysisCategory(
+        organization_id=job.organization_id,
+        analysis_id=analysis.id,
+        category="groundwater",
+        status=CategoryStatus.complete,
+        confidence=Confidence.medium,
+        confidence_reason="Nearby wells provide regional context and do not establish groundwater availability.",
+    ))
+    for name, value, metric_unit in (
+        ("well_count", result.metrics.get("well_count"), "count"),
+        ("well_depth_min", result.metrics.get("well_depth_min"), "feet"),
+        ("well_depth_median", result.metrics.get("well_depth_median"), "feet"),
+        ("well_depth_max", result.metrics.get("well_depth_max"), "feet"),
+        ("distinct_aquifer_count", result.metrics.get("distinct_aquifer_count"), "count"),
+        ("nearest_well_distance_m", result.metrics.get("nearest_well_distance_m"), "metres"),
+        ("search_radius", result.metrics.get("search_radius"), "miles"),
+    ):
+        if value is not None:
+            session.add(DerivedMetric(
+                organization_id=job.organization_id, analysis_id=analysis.id, category="groundwater",
+                name=name, value=float(value), unit=metric_unit,
+            ))
+    for unit in result.wells:
+        row = Well(
+            organization_id=job.organization_id,
+            analysis_id=analysis.id,
+            geometry=from_shape(unit.geometry, srid=4326),
+            state_well_number=unit.state_well_number,
+            depth=unit.depth,
+            water_level=None,
+            aquifer=unit.aquifer,
+            use_type=unit.use_type,
+            completion_date=None,
+            distance_to_parcel=unit.distance_to_parcel_m,
+            query_radius_miles=int(round(float(result.metrics["search_radius"]))),
+        )
+        session.add(row)
+        session.flush()
+        _source_ref(session, job.organization_id, source, "wells", row.id)
+        layer = AnalysisLayer(
+            organization_id=job.organization_id,
+            analysis_id=analysis.id,
+            category="groundwater",
+            geometry=from_shape(unit.geometry, srid=4326),
+            layer_metadata={
+                "availability_flags": unit.availability_flags,
+                "availability_flags_are_not_measurements": True,
+                "water_level": None,
+                "completion_date": None,
+                "stage_timings": result.stage_timings,
                 "warnings": result.warnings,
                 "preliminary_planning_only": True,
             },
@@ -1169,10 +1404,19 @@ def _terrain_analysis(session: Session, job: Job) -> None:
         _persist_category_unavailable(session, job, analysis, "hydrology", str(exc))
     soils_warnings: list[dict[str, Any]] = []
     ecology_warnings: list[dict[str, Any]] = []
+    wetlands_warnings: list[dict[str, Any]] = []
+    flood_warnings: list[dict[str, Any]] = []
+    groundwater_warnings: list[dict[str, Any]] = []
     soils_stage_timings: dict[str, float] = {}
     ecology_stage_timings: dict[str, float] = {}
+    wetlands_stage_timings: dict[str, float] = {}
+    flood_stage_timings: dict[str, float] = {}
+    groundwater_stage_timings: dict[str, float] = {}
     soils_available = False
     ecology_available = False
+    wetlands_available = False
+    flood_available = False
+    groundwater_available = False
     try:
         soils_started = time.perf_counter()
         soils_result = run_soils(source_geometry, float(parcel.computed_acres or 0.0))
@@ -1213,9 +1457,51 @@ def _terrain_analysis(session: Session, job: Job) -> None:
     except EcologySourceError as exc:
         ecology_warnings.append({"code": "ecology_source_unavailable", "message": str(exc)})
         _persist_category_unavailable(session, job, analysis, "ecology", str(exc))
+    try:
+        wetlands_started = time.perf_counter()
+        wetlands_result = run_wetlands(source_geometry, float(parcel.computed_acres or 0.0))
+        wetlands_stage_timings.update(wetlands_result.stage_timings)
+        wetlands_stage_timings["wetlands_total"] = time.perf_counter() - wetlands_started
+        wetlands_warnings.extend(wetlands_result.warnings)
+        _persist_wetlands(session, job, analysis, wetlands_result)
+        wetlands_available = True
+    except WetlandsSourceError as exc:
+        wetlands_warnings.append({"code": "wetlands_source_unavailable", "message": str(exc)})
+        _persist_category_unavailable(session, job, analysis, "wetlands", str(exc))
+    try:
+        flood_started = time.perf_counter()
+        flood_result = run_flood(source_geometry, float(parcel.computed_acres or 0.0))
+        flood_stage_timings.update(flood_result.stage_timings)
+        flood_stage_timings["flood_total"] = time.perf_counter() - flood_started
+        flood_warnings.extend(flood_result.warnings)
+        if flood_result.available:
+            _persist_flood(session, job, analysis, flood_result)
+            flood_available = True
+        else:
+            _persist_category_unavailable(
+                session, job, analysis, "flood",
+                "No digital FIRM coverage intersects the parcel; this is not evidence of no flood risk.",
+            )
+    except FloodSourceError as exc:
+        flood_warnings.append({"code": "flood_source_unavailable", "message": str(exc)})
+        _persist_category_unavailable(session, job, analysis, "flood", str(exc))
+    try:
+        groundwater_started = time.perf_counter()
+        groundwater_result = run_groundwater(source_geometry)
+        groundwater_stage_timings.update(groundwater_result.stage_timings)
+        groundwater_stage_timings["groundwater_total"] = time.perf_counter() - groundwater_started
+        groundwater_warnings.extend(groundwater_result.warnings)
+        _persist_groundwater(session, job, analysis, groundwater_result)
+        groundwater_available = True
+    except GroundwaterSourceError as exc:
+        groundwater_warnings.append({"code": "groundwater_source_unavailable", "message": str(exc)})
+        _persist_category_unavailable(session, job, analysis, "groundwater", str(exc))
     all_warnings = ([result.warning] if result.warning else []) + hydrology_warnings
     all_warnings.extend(soils_warnings)
     all_warnings.extend(ecology_warnings)
+    all_warnings.extend(wetlands_warnings)
+    all_warnings.extend(flood_warnings)
+    all_warnings.extend(groundwater_warnings)
     _set_job(
         session,
         job,
@@ -1225,11 +1511,17 @@ def _terrain_analysis(session: Session, job: Job) -> None:
             "hydrology": "partial" if hydrology_warnings else "complete",
             "soils": "complete" if soils_available else "unavailable",
             "ecology": "complete" if ecology_available else "unavailable",
+            "wetlands": "complete" if wetlands_available else "unavailable",
+            "flood": "complete" if flood_available else "unavailable",
+            "groundwater": "complete" if groundwater_available else "unavailable",
             "stage_timings": {
                 **stage_timings,
                 **hydrology_stage_timings,
                 **soils_stage_timings,
                 **ecology_stage_timings,
+                **wetlands_stage_timings,
+                **flood_stage_timings,
+                **groundwater_stage_timings,
             },
         },
         "; ".join(

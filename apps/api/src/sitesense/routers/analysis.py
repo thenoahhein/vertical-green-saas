@@ -100,6 +100,27 @@ async def analysis(project_id: UUID, db: AsyncSession = Depends(get_db), org: Cu
         .order_by(AnalysisCategory.created_at.desc())
         .limit(1)
     )
+    wetlands_category = await db.scalar(
+        select(AnalysisCategory).where(
+            AnalysisCategory.analysis_id == analysis_row.id,
+            AnalysisCategory.category == "wetlands",
+            AnalysisCategory.organization_id == org.organization_id,
+        ).order_by(AnalysisCategory.created_at.desc()).limit(1)
+    )
+    flood_category = await db.scalar(
+        select(AnalysisCategory).where(
+            AnalysisCategory.analysis_id == analysis_row.id,
+            AnalysisCategory.category == "flood",
+            AnalysisCategory.organization_id == org.organization_id,
+        ).order_by(AnalysisCategory.created_at.desc()).limit(1)
+    )
+    groundwater_category = await db.scalar(
+        select(AnalysisCategory).where(
+            AnalysisCategory.analysis_id == analysis_row.id,
+            AnalysisCategory.category == "groundwater",
+            AnalysisCategory.organization_id == org.organization_id,
+        ).order_by(AnalysisCategory.created_at.desc()).limit(1)
+    )
     metric_result = await db.execute(
         select(DerivedMetric)
         .where(
@@ -111,6 +132,9 @@ async def analysis(project_id: UUID, db: AsyncSession = Depends(get_db), org: Cu
     hydrology_payload: dict[str, object] = {}
     soils_payload: dict[str, object] = {}
     ecology_payload: dict[str, object] = {}
+    wetlands_payload: dict[str, object] = {}
+    flood_payload: dict[str, object] = {}
+    groundwater_payload: dict[str, object] = {}
     histogram: dict[str, dict[str, object]] = {}
     for metric in metric_result.scalars():
         if metric.value is None:
@@ -125,6 +149,12 @@ async def analysis(project_id: UUID, db: AsyncSession = Depends(get_db), org: Cu
                 target = soils_payload
             elif metric.category == "ecology":
                 target = ecology_payload
+            elif metric.category == "wetlands":
+                target = wetlands_payload
+            elif metric.category == "flood":
+                target = flood_payload
+            elif metric.category == "groundwater":
+                target = groundwater_payload
             else:
                 target = terrain_payload
             target[metric.name] = metric.value
@@ -202,6 +232,9 @@ async def analysis(project_id: UUID, db: AsyncSession = Depends(get_db), org: Cu
     for category_name, payload, category_row in (
         ("soils", soils_payload, soils_category),
         ("ecology", ecology_payload, ecology_category),
+        ("wetlands", wetlands_payload, wetlands_category),
+        ("flood", flood_payload, flood_category),
+        ("groundwater", groundwater_payload, groundwater_category),
     ):
         if category_row is not None:
             payload["status"] = category_row.status.value
@@ -223,6 +256,9 @@ async def analysis(project_id: UUID, db: AsyncSession = Depends(get_db), org: Cu
         hydrology=hydrology_payload or None,
         soils=soils_payload or None,
         ecology=ecology_payload or None,
+        wetlands=wetlands_payload or None,
+        flood=flood_payload or None,
+        groundwater=groundwater_payload or None,
         warnings=warnings,
     )
 

@@ -270,3 +270,40 @@ Both categories are preliminary planning outputs requiring field verification
 and professional review. They do not make engineering-grade suitability
 claims. Each persisted unit and layer has explicit upstream provenance, source
 metadata, coverage or answered-layer context, and stage timings.
+
+## Wetlands, flood and groundwater analysis
+
+Wetlands screening uses the USFWS National Wetlands Inventory ArcGIS service.
+The adapter queries both the parcel and a 500-foot (152.4 metre) context buffer,
+clips parcel-intersecting features, and measures acreage in EPSG:6579. Adjacent
+features retain source-reported acreage and their EPSG:3081 distance to the
+parcel. NWI is a remote-sensing inventory at approximately 1:12,000, not a
+jurisdictional determination; field delineation and USACE review are required.
+Zero returned features is mapped absence and remains an available category with
+an explicit warning, never a claim that no wetlands exist.
+
+Flood screening queries FEMA NFHL availability before layer 28 flood zones.
+Missing availability coverage means no digital FIRM coverage, not no flood
+risk. FEMA polygons are clipped and measured in EPSG:6579. Annual chance is
+mapped only by these explicit rules: zones A, AE, AH, AO, AR, A99, V and VE
+mean 1% annual chance (100-year); a `ZONE_SUBTY` containing `0.2 PCT` means
+0.2% annual chance (500-year); X means minimal mapped hazard; D means
+undetermined hazard; and all other values preserve the source fields with a
+null annual chance. `SFHA_TF == "T"` alone determines SFHA acreage, while
+`FLOODWAY` in `ZONE_SUBTY` determines floodway acreage. FEMA `-9999`
+sentinels for BFE, depth and velocity become null. TWDB BLE is status/context
+only, never an authoritative supplemental flood extent, and failures are
+isolated as partial warnings.
+
+Groundwater screening queries the TWDB voluntary well database using a
+configurable one-mile default envelope, then filters by true EPSG:3081
+boundary distance so envelope corners cannot leak into results. Zero wells is
+available context, not evidence of no groundwater. Water level and completion
+date remain null because this layer does not publish them. Water-level and
+water-quality availability flags indicate records elsewhere, not measurements.
+Owner names and other personal information are not stored. Nearby wells are
+regional context only and do not establish groundwater availability.
+
+All three categories are preliminary planning information requiring field
+verification and professional review. Every persisted record and layer carries
+source provenance, category status, warnings, and stage timings.
