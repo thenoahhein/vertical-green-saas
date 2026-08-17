@@ -12,7 +12,7 @@ from sitesense.db import get_db
 from sitesense.main import app
 from sitesense.models import Organization, OrganizationUser, User
 from sitesense_worker.tasks import configure_database
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, select, text
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -109,8 +109,16 @@ async def seed_auth(
 ) -> None:
     organization_id, user_id = seeded_ids
     async with db_sessionmaker() as session:
-        session.add(Organization(id=organization_id, name="Test Organization"))
-        session.add(User(id=user_id, email="test@example.com", name="Test User"))
-        await session.commit()
-        session.add(OrganizationUser(organization_id=organization_id, user_id=user_id, role="owner"))
+        if await session.scalar(select(Organization.id).where(Organization.id == organization_id)) is None:
+            session.add(Organization(id=organization_id, name="Test Organization"))
+        if await session.scalar(select(User.id).where(User.id == user_id)) is None:
+            session.add(User(id=user_id, email="test@example.com", name="Test User"))
+        await session.flush()
+        if await session.scalar(
+            select(OrganizationUser.organization_id).where(
+                OrganizationUser.organization_id == organization_id,
+                OrganizationUser.user_id == user_id,
+            )
+        ) is None:
+            session.add(OrganizationUser(organization_id=organization_id, user_id=user_id, role="owner"))
         await session.commit()

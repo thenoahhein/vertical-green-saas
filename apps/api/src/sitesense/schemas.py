@@ -1,3 +1,4 @@
+from typing import Any
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -19,7 +20,7 @@ class JobRead(BaseModel):
     id: UUID
     project_id: UUID
     stage: str
-    category_status: dict[str, str]
+    category_status: dict[str, Any]
     error_detail: str | None = None
 
 
@@ -34,10 +35,54 @@ class AnalysisRead(BaseModel):
     status: str
     confidence: str
     confidence_reason: str
+    terrain: dict[str, object] | None = None
+    hydrology: dict[str, object] | None = None
+    warnings: list[dict[str, object]] = Field(default_factory=list)
+
+
+class AnalysisLayerRead(BaseModel):
+    id: UUID
+    category: str
+    object_store_key: str | None = None
+    geometry: dict[str, object] | None = None
+    metadata: dict[str, object] = Field(default_factory=dict)
+
+
+class ParcelCandidate(BaseModel):
+    candidate_id: UUID
+    county: str
+    source_url: str
+    source_feature_id: str
+    parcel_id: str
+    situs_address: str | None = None
+    legal_description: str | None = None
+    appraisal_acres: float | None = None
+    computed_acres: float
+    owner: str | None = None
+    geometry: dict[str, object]
+    raw_attributes: dict[str, object] = Field(default_factory=dict)
+    distance_meters: float | None = None
+    contains_point: bool = False
+
+
+class ParcelSearchResponse(BaseModel):
+    candidates: list[ParcelCandidate]
+    latitude: float
+    longitude: float
+    matched_address: str | None = None
+    geocoder_failed: bool = False
+    source_health: list[dict[str, str]] = Field(default_factory=list)
+    disclaimer: str
 
 
 class ParcelSearchRequest(BaseModel):
-    address: str
+    address: str | None = None
+    latitude: float | None = Field(default=None, ge=-90, le=90)
+    longitude: float | None = Field(default=None, ge=-180, le=180)
+    buffer_meters: float = Field(default=1000, ge=0, le=5000)
+
+    def has_coordinates(self) -> bool:
+        return self.latitude is not None and self.longitude is not None
 
 
 class GoalCreate(BaseModel):
@@ -56,7 +101,20 @@ class NotImplementedResponse(BaseModel):
 
 
 class ParcelConfirmRequest(BaseModel):
+    candidate: ParcelCandidate
+
+
+class ConfirmedParcelRead(BaseModel):
     parcel_id: UUID
+    project_id: UUID
+    county: str
+    appraisal_parcel_id: str
+    situs_address: str | None = None
+    legal_description: str | None = None
+    appraisal_record_acres: float | None = None
+    computed_acres: float | None = None
+    geometry: dict[str, object]
+    disclaimer: str
 
 
 class GoalUpdate(BaseModel):

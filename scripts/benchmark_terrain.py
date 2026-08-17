@@ -1,0 +1,78 @@
+"""Opt-in live PRD §47 terrain benchmark over the committed address cases."""
+
+import asyncio
+import json
+import time
+from pathlib import Path
+
+import httpx
+
+CASES = Path(__file__).parents[1] / "apps" / "api" / "tests" / "fixtures" / "benchmark" / "address_resolution.json"
+REQUIRED_FIELDS = {
+    "elevation_min_m",
+    "elevation_max_m",
+    "elevation_mean_m",
+    "relief_m",
+    "mean_slope_percent",
+    "slope_histogram",
+}
+HYDROLOGY_FIELDS = {
+    "contributing_acres_within_window",
+    "window_truncated",
+    "drainage_line_count",
+    "catchment_count",
+}
+
+
+async def run() -> None:
+    cases = json.loads(CASES.read_text())["cases"]
+    headers = {"Authorization": "Bearer dev-token"}
+    async with httpx.AsyncClient(base_url="http://localhost:8000", headers=headers, timeout=180) as client:
+        for case in cases:
+            started = time.perf_counter()
+            search = await client.get("/api/parcel-search", params={"address": case["address"]})
+            search.raise_for_status()
+            candidates = search.json()["candidates"]
+            candidate = next(item for item in candidates if item["parcel_id"] == case["expected_parcel_id"])
+            project = await client.post("/api/projects", json={"name": case["address"]})
+            project.raise_for_status()
+            project_id = project.json()["id"]
+            confirm = await client.post(f"/api/projects/{project_id}/parcel", json={"candidate": candidate})
+            confirm.raise_for_status()
+            job = await client.post(f"/api/projects/{project_id}/analyze")
+            job.raise_for_status()
+            while True:
+                status = await client.get(f"/api/projects/{project_id}/analysis/status")
+                status.raise_for_status()
+                if status.json()["stage"] in {"complete", "partial", "failed"}:
+                    break
+                await asyncio.sleep(1)
+            analysis = await client.get(f"/api/projects/{project_id}/analysis")
+            analysis.raise_for_status()
+            layers = await client.get(f"/api/projects/{project_id}/layers")
+            layers.raise_for_status()
+            terrain = analysis.json().get("terrain") or {}
+            hydrology = analysis.json().get("hydrology") or {}
+            layer_rows = layers.json()
+            corridor_rows = [
+                row.get("metadata", {})
+                for row in layer_rows
+                if row.get("category") == "hydrology_corridors"
+            ]
+            elapsed = time.perf_counter() - started
+            missing = sorted(REQUIRED_FIELDS - terrain.keys())
+            missing_hydrology = sorted(HYDROLOGY_FIELDS - hydrology.keys())
+            print(
+                f"{case['county']} {case['expected_parcel_id']} "
+                f"seconds={elapsed:.2f} coverage={terrain.get('coverage_fraction')} "
+                f"terrain_required={not missing} missing={','.join(missing)} "
+                f"hydrology_required={not missing_hydrology} "
+                f"hydrology_truncated={hydrology.get('window_truncated')} "
+                f"corridors={len(corridor_rows)} "
+                f"parcel_lengths_ft={sum(float(row.get('parcel_length_ft', 0)) for row in corridor_rows):.1f} "
+                f"missing_hydrology={','.join(missing_hydrology)}"
+            )
+
+
+if __name__ == "__main__":
+    asyncio.run(run())
