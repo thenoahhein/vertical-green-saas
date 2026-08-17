@@ -22,7 +22,15 @@ jobs:
         with:
           path: .venv/lib/python3.12/site-packages/whitebox/WBT
           key: whitebox-${{ runner.os }}-${{ hashFiles('uv.lock') }}
-      - run: uv run python -c "from whitebox.whitebox_tools import download_wbt; download_wbt(verbose=False)"
+      - name: Warm WhiteboxTools
+        run: |
+          WBT_DIR=".venv/lib/python3.12/site-packages/whitebox/WBT"
+          WBT_BINARY="$WBT_DIR/whitebox_tools"
+          if [ ! -x "$WBT_BINARY" ]; then
+            rm -rf "$WBT_DIR"
+            uv run python -c "from whitebox.whitebox_tools import download_wbt; download_wbt(verbose=False)"
+          fi
+          test -x "$WBT_BINARY"
       - run: uv run ruff check apps/api apps/worker seed.py
       - run: uv run mypy apps/api/src apps/worker/src
       - run: uv run pytest apps/api/tests
