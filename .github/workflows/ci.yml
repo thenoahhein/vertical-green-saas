@@ -26,11 +26,13 @@ jobs:
         run: |
           WBT_DIR=".venv/lib/python3.12/site-packages/whitebox/WBT"
           WBT_BINARY="$WBT_DIR/whitebox_tools"
-          if [ ! -x "$WBT_BINARY" ]; then
+          PACKAGE_BINARY=".venv/lib/python3.12/site-packages/whitebox/whitebox_tools"
+          if [ ! -x "$WBT_BINARY" ] || [ ! -x "$PACKAGE_BINARY" ]; then
             rm -rf "$WBT_DIR"
             uv run python -c "from whitebox.whitebox_tools import download_wbt; download_wbt(verbose=False)"
           fi
           test -x "$WBT_BINARY"
+          test -x "$PACKAGE_BINARY"
       - run: uv run ruff check apps/api apps/worker seed.py
       - run: uv run mypy apps/api/src apps/worker/src
       - run: uv run pytest apps/api/tests
