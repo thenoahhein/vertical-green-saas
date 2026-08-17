@@ -10,10 +10,10 @@ from typing import Any, cast
 
 import httpx
 from pyproj import Transformer
-from shapely.geometry import MultiPolygon, Polygon, shape
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import transform
 
+from sitesense.arcgis import bounded_query_geometry, parse_polygon_geometry
 from sitesense.disclaimers import DISCLAIMERS
 from sitesense.geo import acreage
 
@@ -24,6 +24,7 @@ NWI_QUERY_URL = (
 NWI_SOURCE_URL = NWI_QUERY_URL
 NWI_BUFFER_METERS = 152.4
 NWI_PAGE_SIZE = 1000
+NWI_MAX_RECORD_COUNT = 1000
 _LENGTH_PROJECTOR = Transformer.from_crs("EPSG:4326", "EPSG:3081", always_xy=True)
 _INVERSE_LENGTH_PROJECTOR = Transformer.from_crs("EPSG:3081", "EPSG:4326", always_xy=True)
 
@@ -54,20 +55,6 @@ class WetlandsResult:
     available: bool = True
 
 
-def _query_geometry(geometry: BaseGeometry) -> dict[str, Any]:
-    if isinstance(geometry, Polygon):
-        rings: list[list[tuple[float, float]]] = [list(geometry.exterior.coords)]
-        rings.extend(list(interior.coords) for interior in geometry.interiors)
-    elif isinstance(geometry, MultiPolygon):
-        rings = []
-        for polygon in geometry.geoms:
-            rings.append(list(polygon.exterior.coords))
-            rings.extend(list(interior.coords) for interior in polygon.interiors)
-    else:
-        raise WetlandsSourceError("NWI parcel geometry must be a polygon or multipolygon.")
-    return {"rings": rings}
-
-
 def _rows(payload: Any) -> list[dict[str, Any]]:
     if not isinstance(payload, dict) or not isinstance(payload.get("features"), list):
         raise WetlandsSourceError("NWI response had an unexpected shape.")
@@ -96,28 +83,29 @@ def _feature_id(feature: dict[str, Any]) -> str:
 
 
 def _geometry(value: dict[str, Any]) -> BaseGeometry:
-    if value.get("type"):
-        return shape(value)
-    rings = value.get("rings")
-    if not isinstance(rings, list) or not rings:
-        raise WetlandsSourceError("NWI feature geometry was invalid.")
-    return Polygon(rings[0], [ring for ring in rings[1:] if isinstance(ring, list)])
+    try:
+        return parse_polygon_geometry(value, "NWI")
+    except ValueError as exc:
+        raise WetlandsSourceError(str(exc)) from exc
 
 
 def _query(
     geometry: BaseGeometry,
     client: httpx.Client,
     label: str,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     rows: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
     offset = 0
+    geometry_json, geometry_warnings = bounded_query_geometry(geometry)
+    warnings.extend(geometry_warnings)
     while True:
-        response = client.get(
+        response = client.post(
             NWI_QUERY_URL,
-            params={
-                "f": "json",
+            data={
+                "f": "geojson",
                 "where": "1=1",
-                "geometry": json.dumps(_query_geometry(geometry), separators=(",", ":")),
+                "geometry": geometry_json,
                 "geometryType": "esriGeometryPolygon",
                 "inSR": "4326",
                 "spatialRel": "esriSpatialRelIntersects",
@@ -125,14 +113,14 @@ def _query(
                 "returnGeometry": "true",
                 "outSR": "4326",
                 "resultOffset": str(offset),
-                "resultRecordCount": str(NWI_PAGE_SIZE),
+                "resultRecordCount": str(min(NWI_PAGE_SIZE, NWI_MAX_RECORD_COUNT)),
             },
         )
         response.raise_for_status()
         page = _rows(response.json())
         rows.extend(page)
-        if len(page) < NWI_PAGE_SIZE:
-            return rows
+        if len(page) < min(NWI_PAGE_SIZE, NWI_MAX_RECORD_COUNT):
+            return rows, warnings
         offset += len(page)
 
 
@@ -140,7 +128,7 @@ def _request(
     geometry: BaseGeometry,
     client: httpx.Client,
     label: str,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     last_error: Exception | None = None
     for _ in range(2):
         try:
@@ -166,11 +154,10 @@ def run_wetlands(
             _INVERSE_LENGTH_PROJECTOR.transform,
             parcel_projected.buffer(NWI_BUFFER_METERS),
         )
-        parcel_rows = _request(parcel_geometry, http_client, "parcel")
-        buffer_rows = _request(buffered_geometry, http_client, "buffer")
-        parcel_ids = {_feature_id(row) for row in parcel_rows}
+        query_started = time.perf_counter()
+        buffer_rows, query_warnings = _request(buffered_geometry, http_client, "buffer")
+        query_elapsed = time.perf_counter() - query_started
         merged: dict[str, dict[str, Any]] = {_feature_id(row): row for row in buffer_rows}
-        merged.update({_feature_id(row): row for row in parcel_rows})
         units: list[WetlandResult] = []
         for feature in merged.values():
             attributes = feature.get("attributes", feature.get("properties", {}))
@@ -181,8 +168,8 @@ def run_wetlands(
             source_acres_value = _attribute(attributes, "Wetlands.ACRES")
             source_acres = None if source_acres_value is None else float(source_acres_value)
             geometry = _geometry(feature["geometry"])
-            intersects = _feature_id(feature) in parcel_ids or geometry.intersects(parcel_geometry)
-            clipped = geometry.intersection(parcel_geometry) if intersects else geometry
+            intersects = geometry.intersects(parcel_geometry)
+            clipped = geometry.intersection(parcel_geometry) if intersects else geometry.intersection(buffered_geometry)
             if clipped.is_empty:
                 continue
             distance = 0.0 if intersects else float(
@@ -195,7 +182,7 @@ def run_wetlands(
                     geometry=clipped,
                     nwi_attribute_code=None if code is None else str(code),
                     wetland_type=None if wetland_type is None else str(wetland_type),
-                    acres=acreage(clipped) if intersects else (source_acres or acreage(geometry)),
+                    acres=acreage(clipped),
                     source_acres=source_acres,
                     intersects_parcel=intersects,
                     distance_to_parcel_m=distance,
@@ -203,7 +190,7 @@ def run_wetlands(
             )
         intersected_acres = sum(unit.acres for unit in units if unit.intersects_parcel)
         adjacent_acres = sum(unit.acres for unit in units if not unit.intersects_parcel)
-        warnings: list[dict[str, Any]] = [
+        warnings: list[dict[str, Any]] = query_warnings + [
             {
                 "code": "nwi_screening_disclaimer",
                 "message": (
@@ -220,14 +207,14 @@ def run_wetlands(
                     "message": "NWI returned no mapped wetland features; this is not evidence that no wetlands are present.",
                 }
             )
-        timings = {"parcel_query": 0.0, "buffer_query": 0.0}
+        timings = {"buffer_query": query_elapsed}
         timings["wetlands_total"] = time.perf_counter() - started
         return WetlandsResult(
             units=units,
             metrics={
                 "parcel_acres": parcel_acres,
                 "wetland_acres": intersected_acres,
-                "adjacent_wetland_acres": adjacent_acres,
+                "adjacent_buffer_wetland_acres": adjacent_acres,
                 "wetland_count": sum(unit.intersects_parcel for unit in units),
                 "adjacent_wetland_count": sum(not unit.intersects_parcel for unit in units),
                 "buffer_meters": NWI_BUFFER_METERS,

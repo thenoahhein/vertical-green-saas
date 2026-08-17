@@ -5,6 +5,7 @@ import json
 import httpx
 import pytest
 from shapely.geometry import box
+from sitesense.arcgis import bounded_query_geometry
 from sitesense.flood import (
     FEMA_AVAILABILITY_URL,
     FEMA_ZONES_URL,
@@ -12,8 +13,10 @@ from sitesense.flood import (
     annual_chance,
     run_flood,
 )
+from sitesense.flood import _geometry as flood_geometry
 from sitesense.groundwater import run_groundwater
 from sitesense.wetlands import NWI_QUERY_URL, WetlandsSourceError, run_wetlands
+from sitesense.wetlands import _geometry as wetlands_geometry
 
 
 def _response(url: str, payload: dict[str, object]) -> httpx.Response:
@@ -24,7 +27,7 @@ class WetlandsClient:
     def __init__(self, pages: list[dict[str, object]]) -> None:
         self.pages = iter(pages)
 
-    def get(self, url: str, **_kwargs: object) -> httpx.Response:
+    def post(self, url: str, **_kwargs: object) -> httpx.Response:
         assert url == NWI_QUERY_URL
         return _response(url, next(self.pages))
 
@@ -64,6 +67,44 @@ def test_wetlands_requires_qualified_fields_and_paginates() -> None:
         )
 
 
+def test_wetlands_adjacent_acres_are_buffer_scoped() -> None:
+    adjacent = _wetland_feature()
+    adjacent["id"] = "adjacent"
+    adjacent["geometry"] = {
+        "type": "Polygon",
+        "coordinates": [[
+            [-96.9978, 30.0], [-96.997, 30.0], [-96.997, 30.001],
+            [-96.9978, 30.001], [-96.9978, 30.0],
+        ]],
+    }
+    adjacent["attributes"]["Wetlands.ACRES"] = 1000.0  # type: ignore[index]
+    pages = [{"features": [_wetland_feature(), adjacent]}, {"features": []}]
+    result = run_wetlands(box(-97.0, 30.0, -96.998, 30.001), 10.0, WetlandsClient(pages))
+    unit = next(unit for unit in result.units if not unit.intersects_parcel)
+    assert unit.acres < unit.source_acres
+    assert result.metrics["adjacent_buffer_wetland_acres"] == unit.acres
+
+
+def test_wetlands_and_flood_multipart_geometry_preserves_holes() -> None:
+    exterior_one = [[-97.0, 30.0], [-96.999, 30.0], [-96.999, 30.001], [-97.0, 30.001], [-97.0, 30.0]]
+    hole = [[-96.9998, 30.0002], [-96.9992, 30.0002], [-96.9992, 30.0008], [-96.9998, 30.0008], [-96.9998, 30.0002]]
+    exterior_two = [[-96.998, 30.0], [-96.997, 30.0], [-96.997, 30.001], [-96.998, 30.001], [-96.998, 30.0]]
+    value = {"rings": [exterior_one, hole[::-1], exterior_two]}
+    wetlands = wetlands_geometry(value)
+    flood = flood_geometry(value)
+    assert wetlands.geom_type == "MultiPolygon"
+    assert flood.geom_type == "MultiPolygon"
+    assert wetlands.area < 0.000003
+    assert flood.area == wetlands.area
+
+
+def test_bounded_geometry_fallback_is_explicit() -> None:
+    geometry = box(-97.0, 30.0, -96.9, 30.1).buffer(0)
+    value, warnings = bounded_query_geometry(geometry, max_chars=20)
+    assert value
+    assert warnings[0]["code"] in {"query_geometry_simplified", "query_geometry_envelope_fallback"}
+
+
 class FloodClient:
     def __init__(self, availability: list[dict[str, object]], zones: list[dict[str, object]], ble: list[dict[str, object]]) -> None:
         self.responses = {
@@ -72,7 +113,7 @@ class FloodClient:
             TWDB_BLE_URL: iter(ble),
         }
 
-    def get(self, url: str, **_kwargs: object) -> httpx.Response:
+    def post(self, url: str, **_kwargs: object) -> httpx.Response:
         if url == TWDB_BLE_URL:
             raise httpx.ConnectError("offline")
         return _response(url, next(self.responses[url]))

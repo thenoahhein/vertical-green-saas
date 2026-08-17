@@ -274,10 +274,12 @@ metadata, coverage or answered-layer context, and stage timings.
 ## Wetlands, flood and groundwater analysis
 
 Wetlands screening uses the USFWS National Wetlands Inventory ArcGIS service.
-The adapter queries both the parcel and a 500-foot (152.4 metre) context buffer,
-clips parcel-intersecting features, and measures acreage in EPSG:6579. Adjacent
-features retain source-reported acreage and their EPSG:3081 distance to the
-parcel. NWI is a remote-sensing inventory at approximately 1:12,000, not a
+The adapter queries a 500-foot (152.4 metre) context buffer, classifies
+parcel intersection geometrically, and measures acreage in EPSG:6579. Adjacent
+features are clipped to that buffer for the
+`adjacent_buffer_wetland_acres` metric; their whole source-reported acreage is
+retained separately in layer metadata and must not be confused with the
+buffer-scoped acreage. NWI is a remote-sensing inventory at approximately 1:12,000, not a
 jurisdictional determination; field delineation and USACE review are required.
 Zero returned features is mapped absence and remains an available category with
 an explicit warning, never a claim that no wetlands exist.

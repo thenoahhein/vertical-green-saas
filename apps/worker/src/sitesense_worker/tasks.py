@@ -501,7 +501,7 @@ def _persist_wetlands(
     ))
     for name, value, metric_unit in (
         ("wetland_acres", result.metrics.get("wetland_acres"), "acres"),
-        ("adjacent_wetland_acres", result.metrics.get("adjacent_wetland_acres"), "acres"),
+        ("adjacent_buffer_wetland_acres", result.metrics.get("adjacent_buffer_wetland_acres"), "acres"),
         ("wetland_count", result.metrics.get("wetland_count"), "count"),
         ("adjacent_wetland_count", result.metrics.get("adjacent_wetland_count"), "count"),
     ):
@@ -528,8 +528,12 @@ def _persist_wetlands(
             category="wetlands",
             geometry=from_shape(_as_multipolygon(unit.geometry), srid=4326),
             layer_metadata={
-                "source_acres": unit.source_acres,
-                "acres_semantics": "clipped EPSG:6579 acreage" if unit.intersects_parcel else "source-reported acreage",
+                "source_reported_acres": unit.source_acres,
+                "acres_semantics": (
+                    "parcel-clipped EPSG:6579 acreage"
+                    if unit.intersects_parcel
+                    else "500-foot-buffer-clipped EPSG:6579 acreage; source-reported acreage is separate metadata"
+                ),
                 "intersects_parcel": unit.intersects_parcel,
                 "distance_to_parcel_m": unit.distance_to_parcel_m,
                 "stage_timings": result.stage_timings,
@@ -575,7 +579,7 @@ def _persist_flood(
         analysis_id=analysis.id,
         category="flood",
         status=CategoryStatus.complete,
-        confidence=Confidence.medium if result.warnings else Confidence.high,
+        confidence=Confidence.medium,
         confidence_reason="FEMA NFHL screening with TWDB BLE status context; not an engineering determination.",
     ))
     for name, value, metric_unit in (
@@ -592,6 +596,17 @@ def _persist_flood(
                 organization_id=job.organization_id, analysis_id=analysis.id, category="flood",
                 name=name, value=float(value), unit=metric_unit,
             ))
+    for classification, value in result.metrics.get(
+        "fema_zone_acres_by_classification", {}
+    ).items():
+        session.add(DerivedMetric(
+            organization_id=job.organization_id,
+            analysis_id=analysis.id,
+            category="flood",
+            name=f"fema_zone_acres:{classification}",
+            value=float(value),
+            unit="acres",
+        ))
     for unit in result.zones:
         source_row = ble_source if unit.source_discriminator == "TWDB BLE status" else source
         row = FloodZone(

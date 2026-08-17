@@ -2,16 +2,15 @@
 
 from __future__ import annotations
 
-import json
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, cast
 
 import httpx
-from shapely.geometry import MultiPolygon, Polygon, shape
 from shapely.geometry.base import BaseGeometry
 
+from sitesense.arcgis import bounded_query_geometry, parse_polygon_geometry
 from sitesense.geo import acreage
 
 FEMA_MAPSERVER_URL = "https://hazards.fema.gov/arcgis/rest/services/public/NFHL/MapServer"
@@ -19,6 +18,7 @@ FEMA_AVAILABILITY_URL = f"{FEMA_MAPSERVER_URL}/0/query"
 FEMA_ZONES_URL = f"{FEMA_MAPSERVER_URL}/28/query"
 TWDB_BLE_URL = "https://gis1.twdb.texas.gov/server/rest/services/WSC-FSCA-FM/Texas_BLE_Status/MapServer/0/query"
 FLOOD_PAGE_SIZE = 1000
+FLOOD_MAX_RECORD_COUNT = 2000
 SENTINEL = -9999
 
 
@@ -48,20 +48,6 @@ class FloodResult:
     available: bool = True
 
 
-def _query_geometry(geometry: BaseGeometry) -> dict[str, Any]:
-    if isinstance(geometry, Polygon):
-        rings: list[list[tuple[float, float]]] = [list(geometry.exterior.coords)]
-        rings.extend(list(interior.coords) for interior in geometry.interiors)
-    elif isinstance(geometry, MultiPolygon):
-        rings = []
-        for polygon in geometry.geoms:
-            rings.append(list(polygon.exterior.coords))
-            rings.extend(list(interior.coords) for interior in polygon.interiors)
-    else:
-        raise FloodSourceError("FEMA parcel geometry must be a polygon or multipolygon.")
-    return {"rings": rings}
-
-
 def _rows(payload: Any, label: str) -> list[dict[str, Any]]:
     if not isinstance(payload, dict) or not isinstance(payload.get("features"), list):
         raise FloodSourceError(f"{label} response had an unexpected shape.")
@@ -71,16 +57,24 @@ def _rows(payload: Any, label: str) -> list[dict[str, Any]]:
     return cast(list[dict[str, Any]], rows)
 
 
-def _query(url: str, geometry: BaseGeometry, client: httpx.Client, label: str) -> list[dict[str, Any]]:
+def _query(
+    url: str,
+    geometry: BaseGeometry,
+    client: httpx.Client,
+    label: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     rows: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
     offset = 0
+    geometry_json, geometry_warnings = bounded_query_geometry(geometry)
+    warnings.extend(geometry_warnings)
     while True:
-        response = client.get(
+        response = client.post(
             url,
-            params={
-                "f": "json",
+            data={
+                "f": "geojson",
                 "where": "1=1",
-                "geometry": json.dumps(_query_geometry(geometry), separators=(",", ":")),
+                "geometry": geometry_json,
                 "geometryType": "esriGeometryPolygon",
                 "inSR": "4326",
                 "spatialRel": "esriSpatialRelIntersects",
@@ -88,18 +82,23 @@ def _query(url: str, geometry: BaseGeometry, client: httpx.Client, label: str) -
                 "returnGeometry": "true",
                 "outSR": "4326",
                 "resultOffset": str(offset),
-                "resultRecordCount": str(FLOOD_PAGE_SIZE),
+                "resultRecordCount": str(min(FLOOD_PAGE_SIZE, FLOOD_MAX_RECORD_COUNT)),
             },
         )
         response.raise_for_status()
         page = _rows(response.json(), label)
         rows.extend(page)
-        if len(page) < FLOOD_PAGE_SIZE:
-            return rows
+        if len(page) < min(FLOOD_PAGE_SIZE, FLOOD_MAX_RECORD_COUNT):
+            return rows, warnings
         offset += len(page)
 
 
-def _request(url: str, geometry: BaseGeometry, client: httpx.Client, label: str) -> list[dict[str, Any]]:
+def _request(
+    url: str,
+    geometry: BaseGeometry,
+    client: httpx.Client,
+    label: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     last_error: Exception | None = None
     for _ in range(2):
         try:
@@ -117,12 +116,10 @@ def _attrs(feature: dict[str, Any]) -> dict[str, Any]:
 
 
 def _geometry(value: dict[str, Any]) -> BaseGeometry:
-    if value.get("type"):
-        return shape(value)
-    rings = value.get("rings")
-    if not isinstance(rings, list) or not rings:
-        raise FloodSourceError("FEMA feature geometry was invalid.")
-    return Polygon(rings[0], [ring for ring in rings[1:] if isinstance(ring, list)])
+    try:
+        return parse_polygon_geometry(value, "FEMA")
+    except ValueError as exc:
+        raise FloodSourceError(str(exc)) from exc
 
 
 def _value(attrs: dict[str, Any], key: str) -> Any:
@@ -160,7 +157,11 @@ def run_flood(
     close_client = client is None
     try:
         started = time.perf_counter()
-        availability_rows = _request(FEMA_AVAILABILITY_URL, parcel_geometry, http_client, "FEMA availability")
+        availability_started = time.perf_counter()
+        availability_rows, availability_warnings = _request(
+            FEMA_AVAILABILITY_URL, parcel_geometry, http_client, "FEMA availability"
+        )
+        availability_elapsed = time.perf_counter() - availability_started
         if not availability_rows:
             return FloodResult(
                 zones=[],
@@ -171,16 +172,26 @@ def run_flood(
                 }],
                 source_url=FEMA_MAPSERVER_URL,
                 retrieved_at=retrieved_at,
-                stage_timings={"availability_query": time.perf_counter() - started},
+                stage_timings={"availability_query": availability_elapsed},
                 available=False,
             )
-        zone_rows = _request(FEMA_ZONES_URL, parcel_geometry, http_client, "FEMA flood zones")
+        zone_started = time.perf_counter()
+        zone_rows, zone_warnings = _request(
+            FEMA_ZONES_URL, parcel_geometry, http_client, "FEMA flood zones"
+        )
+        zone_elapsed = time.perf_counter() - zone_started
         ble_warnings: list[dict[str, Any]] = []
         ble_rows: list[dict[str, Any]] = []
+        ble_started = time.perf_counter()
+        ble_geometry_warnings: list[dict[str, Any]] = []
         try:
-            ble_rows = _request(TWDB_BLE_URL, parcel_geometry, http_client, "TWDB BLE status")
+            ble_rows, ble_geometry_warnings = _request(
+                TWDB_BLE_URL, parcel_geometry, http_client, "TWDB BLE status"
+            )
+            ble_elapsed = time.perf_counter() - ble_started
         except FloodSourceError as exc:
             ble_warnings.append({"code": "twdb_ble_partial", "message": str(exc)})
+            ble_elapsed = time.perf_counter() - ble_started
         required = (
             "DFIRM_ID", "FLD_AR_ID", "STUDY_TYP", "FLD_ZONE", "ZONE_SUBTY",
             "SFHA_TF", "STATIC_BFE", "DEPTH", "VELOCITY", "V_DATUM", "LEN_UNIT", "SOURCE_CIT",
@@ -231,14 +242,14 @@ def run_flood(
                 annual_chance=None,
                 attributes=attrs,
             ))
-        warnings = ble_warnings + [{
+        warnings = availability_warnings + zone_warnings + ble_geometry_warnings + ble_warnings + [{
             "code": "twdb_ble_status_only",
             "message": "TWDB BLE provides study status context only; authoritative supplemental flood extents are unavailable.",
         }]
         timings = {
-            "availability_query": 0.0,
-            "fema_zone_query": 0.0,
-            "twdb_ble_query": 0.0,
+            "availability_query": availability_elapsed,
+            "fema_zone_query": zone_elapsed,
+            "twdb_ble_query": ble_elapsed,
             "flood_total": time.perf_counter() - started,
         }
         return FloodResult(
@@ -251,6 +262,20 @@ def run_flood(
                 "static_bfe_min": min(bfe_values) if bfe_values else None,
                 "static_bfe_max": max(bfe_values) if bfe_values else None,
                 "fema_zone_count": sum(zone.source_discriminator == "FEMA NFHL" for zone in zones),
+                "fema_zone_acres_by_classification": {
+                    classification: sum(
+                        zone.acres_intersected
+                        for zone in zones
+                        if zone.source_discriminator == "FEMA NFHL"
+                        and zone.zone_classification == classification
+                    )
+                    for classification in {
+                        zone.zone_classification
+                        for zone in zones
+                        if zone.source_discriminator == "FEMA NFHL"
+                    }
+                    if classification is not None
+                },
                 "twdb_ble_status_count": sum(zone.source_discriminator == "TWDB BLE status" for zone in zones),
                 "preliminary_planning_only": True,
             },

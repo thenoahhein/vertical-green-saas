@@ -5,6 +5,7 @@ from typing import Any
 from uuid import UUID
 
 import pytest
+from geoalchemy2.shape import from_shape
 from shapely.geometry import box
 from sitesense.ecology import EcologicalUnitResult, EcologyResult
 from sitesense.models import (
@@ -12,10 +13,13 @@ from sitesense.models import (
     AnalysisSourceRef,
     CategoryStatus,
     EcologicalUnit,
+    FloodZone,
     Job,
     Project,
     SiteAnalysis,
     SoilUnit,
+    Well,
+    Wetland,
 )
 from sitesense.soils import SoilComponent, SoilsResult, SoilUnitResult
 from sitesense_worker.tasks import _persist_ecology, _persist_soils
@@ -128,3 +132,49 @@ async def test_soils_and_ecology_persistence_has_provenance(
                 AnalysisCategory.category == "soils",
             )
         ) is not None
+
+
+@pytest.mark.asyncio
+async def test_unavailable_rerun_has_no_current_wetland_flood_groundwater_rows(
+    db_sessionmaker: Any,
+    seeded_ids: tuple[UUID, UUID],
+) -> None:
+    organization_id, _ = seeded_ids
+    geometry = from_shape(box(-97.0, 30.0, -96.999, 30.001), srid=4326)
+    async with db_sessionmaker() as session:
+        project = Project(organization_id=organization_id, name="Unavailable rerun")
+        session.add(project)
+        await session.flush()
+        first = SiteAnalysis(organization_id=organization_id, project_id=project.id)
+        session.add(first)
+        await session.flush()
+        session.add_all([
+            Wetland(
+                organization_id=organization_id, analysis_id=first.id, geometry=geometry,
+                intersects_parcel=False,
+            ),
+            FloodZone(
+                organization_id=organization_id, analysis_id=first.id, geometry=geometry,
+                source_discriminator="FEMA NFHL",
+            ),
+            Well(
+                organization_id=organization_id, analysis_id=first.id, geometry=from_shape(
+                    box(-97.0, 30.0, -97.0, 30.0).centroid, srid=4326
+                ),
+                query_radius_miles=1,
+            ),
+        ])
+        second = SiteAnalysis(organization_id=organization_id, project_id=project.id)
+        session.add(second)
+        await session.flush()
+        session.add_all([
+            AnalysisCategory(
+                organization_id=organization_id, analysis_id=second.id, category=category,
+                status=CategoryStatus.unavailable, confidence_reason="source unavailable",
+            )
+            for category in ("wetlands", "flood", "groundwater")
+        ])
+        await session.commit()
+        assert await session.scalar(select(Wetland).where(Wetland.analysis_id == second.id)) is None
+        assert await session.scalar(select(FloodZone).where(FloodZone.analysis_id == second.id)) is None
+        assert await session.scalar(select(Well).where(Well.analysis_id == second.id)) is None
