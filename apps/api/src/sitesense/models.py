@@ -210,7 +210,7 @@ class FloodZone(TenantModel):
     source_discriminator: Mapped[str] = mapped_column(String(40), nullable=False)
     acres_intersected: Mapped[float | None] = mapped_column(Float)
     parcel_percent: Mapped[float | None] = mapped_column(Float)
-    annual_chance: Mapped[str | None] = mapped_column(String(50))
+    annual_chance: Mapped[str | None] = mapped_column(String(100))
 
 
 class Well(TenantModel):

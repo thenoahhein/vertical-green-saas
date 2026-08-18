@@ -9,10 +9,9 @@ from datetime import UTC, datetime
 from typing import Any, cast
 
 import httpx
-from shapely.geometry import MultiPolygon, Polygon, shape
 from shapely.geometry.base import BaseGeometry
-from shapely.ops import unary_union
 
+from sitesense.arcgis import parse_polygon_geometry, polygon_query_geometry
 from sitesense.geo import acreage
 
 TPWD_MAPSERVER_URL = (
@@ -94,16 +93,12 @@ def _query_layer(
     parcel_geometry: BaseGeometry,
     client: httpx.Client,
 ) -> list[dict[str, Any]]:
-    if isinstance(parcel_geometry, MultiPolygon):
-        rings: list[list[tuple[float, float]]] = []
-        for polygon in parcel_geometry.geoms:
-            rings.append(list(polygon.exterior.coords))
-            rings.extend(list(interior.coords) for interior in polygon.interiors)
-        query_geometry: dict[str, Any] = {"rings": rings}
-    elif isinstance(parcel_geometry, Polygon):
-        query_geometry = {"rings": [list(parcel_geometry.exterior.coords)]}
-    else:
-        raise EcologySourceError("TPWD parcel geometry must be a polygon or multipolygon.")
+    try:
+        query_geometry = polygon_query_geometry(parcel_geometry)
+    except ValueError as exc:
+        raise EcologySourceError(
+            "TPWD parcel geometry must be a polygon or multipolygon."
+        ) from exc
     features: list[dict[str, Any]] = []
     offset = 0
     while True:
@@ -127,7 +122,7 @@ def _query_layer(
         payload = response.json()
         page = _feature_rows(payload, layer_id)
         features.extend(page)
-        if not payload.get("exceededTransferLimit") and len(page) < PAGE_SIZE:
+        if not payload.get("exceededTransferLimit") and len(page) < min(PAGE_SIZE, 1000):
             break
         if not page:
             break
@@ -136,45 +131,10 @@ def _query_layer(
 
 
 def _geometry(feature_geometry: dict[str, Any], layer_id: int) -> BaseGeometry:
-    if "type" in feature_geometry and "coordinates" in feature_geometry:
-        try:
-            return shape(feature_geometry)
-        except (TypeError, ValueError) as exc:
-            raise EcologySourceError(
-                f"TPWD layer {layer_id} returned invalid GeoJSON geometry."
-            ) from exc
-    if "rings" in feature_geometry and isinstance(feature_geometry["rings"], list):
-        rings = feature_geometry["rings"]
-        if not all(isinstance(ring, list) for ring in rings):
-            raise EcologySourceError(f"TPWD layer {layer_id} returned invalid polygon rings.")
-        polygons: list[Polygon] = []
-        exteriors: list[tuple[Polygon, bool]] = []
-        for ring in rings:
-            polygon = Polygon(ring)
-            if polygon.is_empty or not polygon.is_valid:
-                continue
-            exteriors.append((polygon, polygon.exterior.is_ccw))
-        if not exteriors:
-            raise EcologySourceError(f"TPWD layer {layer_id} returned no usable polygon rings.")
-        exterior_orientation = max(
-            exteriors,
-            key=lambda item: item[0].area,
-        )[1]
-        exterior_rings = [
-            polygon for polygon, orientation in exteriors if orientation == exterior_orientation
-        ]
-        hole_rings = [
-            polygon for polygon, orientation in exteriors if orientation != exterior_orientation
-        ]
-        for exterior in exterior_rings:
-            holes = [
-                list(hole.exterior.coords)
-                for hole in hole_rings
-                if exterior.contains(hole.representative_point())
-            ]
-            polygons.append(Polygon(exterior.exterior.coords, holes=holes))
-        return unary_union(polygons)
-    raise EcologySourceError(f"TPWD layer {layer_id} returned an unsupported geometry shape.")
+    try:
+        return parse_polygon_geometry(feature_geometry, f"TPWD layer {layer_id}")
+    except ValueError as exc:
+        raise EcologySourceError(str(exc)) from exc
 
 
 def run_ecology(

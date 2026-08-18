@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     object_store_access_key: str = "minio"
     object_store_secret_key: str = "miniopassword"
     cors_allowed_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
+    groundwater_radius_miles: float = 1.0
 
     def allowed_origins(self) -> list[str]:
         return [origin.strip() for origin in self.cors_allowed_origins.split(",") if origin.strip()]

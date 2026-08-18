@@ -39,6 +39,9 @@ class AnalysisRead(BaseModel):
     hydrology: dict[str, object] | None = None
     soils: dict[str, object] | None = None
     ecology: dict[str, object] | None = None
+    wetlands: dict[str, object] | None = None
+    flood: dict[str, object] | None = None
+    groundwater: dict[str, object] | None = None
     warnings: list[dict[str, object]] = Field(default_factory=list)
 
 
